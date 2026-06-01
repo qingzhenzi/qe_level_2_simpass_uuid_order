@@ -1,0 +1,35 @@
+# Compilation artifacts
+target/
+*.rs.bk
+Cargo.lock
+
+# Node.js dependencies
+vue-frontend/node_modules/
+node_modules/
+
+# Environment variables (contains sensitive information)
+.env
+.env.local
+.env.*.local
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Build artifacts
+dist/
+build/
+
+# Database backups
+*.dump
+
+# OS files
+.DS_Store
+Thumbs.db
