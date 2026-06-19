@@ -1,128 +1,163 @@
-use std::sync::Arc;
-use std::collections::{HashMap, VecDeque};
-use dashmap::DashMap;
-use chrono::{Utc, DateTime};
-use tokio::time::{interval, Duration};
+use chrono::Utc;
 use sqlx::PgPool;
+use redis::aio::ConnectionManager;
+use tokio::time::{interval, Duration};
 
-const MAX_ENTRIES_PER_KEY: usize = 300;
-
+/// Redis-based QPS tracker — shared across instances via per-second counters.
+///
+/// Key schema:
+///   {prefix}:qps:paths              — SET of active path names
+///   {prefix}:qps:cnt:{path}:{epoch} — INCR counter for one second+path
+///   {prefix}:qps:dev:{uuid}:{path}:{epoch} — per-developer counter
+///
+/// All counters get a 2-hour TTL so they self-clean.
 #[derive(Clone)]
 pub struct QpsTracker {
-    sliding_windows: Arc<DashMap<String, VecDeque<DateTime<Utc>>>>,
     pg_pool: PgPool,
+    redis_conn: Option<ConnectionManager>,
+    redis_prefix: String,
 }
 
 impl QpsTracker {
-    pub fn new(pg_pool: PgPool) -> Self {
+    pub fn new(
+        pg_pool: PgPool,
+        redis_conn: Option<ConnectionManager>,
+        redis_prefix: String,
+    ) -> Self {
         Self {
-            sliding_windows: Arc::new(DashMap::new()),
             pg_pool,
+            redis_conn,
+            redis_prefix,
         }
     }
 
-    #[allow(dead_code)]
-    pub fn record_request(&self, api_path: &str, developer_uuid: Option<&str>) {
-        let now = Utc::now();
+    // ── record ────────────────────────────────────────────────────────
 
-        let key = format!("total:{}", api_path);
-        let mut entry = self.sliding_windows.entry(key).or_insert_with(VecDeque::new);
-        if entry.len() >= MAX_ENTRIES_PER_KEY {
-            entry.pop_front();
-        }
-        entry.push_back(now);
+    pub async fn record_request(&self, api_path: &str, developer_uuid: Option<&str>) {
+        let now_sec = Utc::now().timestamp();
+        let prefix = &self.redis_prefix;
 
+        let Some(ref conn) = self.redis_conn else { return };
+        let mut conn = conn.clone();
+        use redis::AsyncCommands;
+
+        // total per path
+        let total_key = format!("{}:qps:cnt:{}:{}", prefix, api_path, now_sec);
+        let _: Result<i64, _> = conn.incr(&total_key, 1).await;
+        let _: Result<(), _> = conn.expire(&total_key, 7200).await;
+        let _: Result<(), _> = conn.sadd(format!("{}:qps:paths", prefix), api_path).await;
+
+        // per-developer
         if let Some(uuid) = developer_uuid {
-            let dev_key = format!("dev:{}:{}", uuid, api_path);
-            let mut dev_entry = self.sliding_windows.entry(dev_key).or_insert_with(VecDeque::new);
-            if dev_entry.len() >= MAX_ENTRIES_PER_KEY {
-                dev_entry.pop_front();
-            }
-            dev_entry.push_back(now);
+            let dev_key = format!("{}:qps:dev:{}:{}:{}", prefix, uuid, api_path, now_sec);
+            let _: Result<i64, _> = conn.incr(&dev_key, 1).await;
+            let _: Result<(), _> = conn.expire(&dev_key, 7200).await;
         }
     }
 
-    pub fn get_current_qps(&self, api_path: &str) -> i64 {
-        let now = Utc::now();
-        let one_sec_ago = now - chrono::Duration::seconds(1);
-        let key = format!("total:{}", api_path);
+    // ── queries ───────────────────────────────────────────────────────
 
-        self.sliding_windows
-            .get(&key)
-            .map(|times| {
-                times.iter().filter(|t| **t > one_sec_ago).count() as i64
-            })
-            .unwrap_or(0)
+    pub async fn get_current_qps(&self, api_path: &str) -> i64 {
+        let now_sec = Utc::now().timestamp();
+        let prefix = &self.redis_prefix;
+
+        let Some(ref conn) = self.redis_conn else { return 0 };
+        let mut conn = conn.clone();
+        use redis::AsyncCommands;
+
+        let cur: i64 = conn
+            .get(format!("{}:qps:cnt:{}:{}", prefix, api_path, now_sec))
+            .await
+            .unwrap_or(0);
+        let prev: i64 = conn
+            .get(format!("{}:qps:cnt:{}:{}", prefix, api_path, now_sec - 1))
+            .await
+            .unwrap_or(0);
+        cur.max(prev)
     }
 
-    pub fn get_qps_since(&self, api_path: &str, duration_secs: i64) -> f64 {
-        let now = Utc::now();
-        let cutoff = now - chrono::Duration::seconds(duration_secs);
-        let key = format!("total:{}", api_path);
+    pub async fn get_qps_since(&self, api_path: &str, duration_secs: i64) -> f64 {
+        let now_sec = Utc::now().timestamp();
+        let start_sec = now_sec - duration_secs;
+        let prefix = &self.redis_prefix;
 
-        let count = self.sliding_windows
-            .get(&key)
-            .map(|times| {
-                times.iter().filter(|t| **t > cutoff).count() as f64
-            })
-            .unwrap_or(0.0);
-
-        count / duration_secs as f64
+        if self.redis_conn.is_none() {
+            return 0.0;
+        }
+        let total = self
+            .sum_counters(prefix, api_path, start_sec, now_sec)
+            .await;
+        total as f64 / duration_secs as f64
     }
 
-    pub fn get_all_path_counts_since(&self, duration_secs: i64) -> Vec<(String, i64)> {
-        let now = Utc::now();
-        let cutoff = now - chrono::Duration::seconds(duration_secs);
-        let mut counts: HashMap<String, i64> = HashMap::new();
+    pub async fn get_all_path_counts_since(&self, duration_secs: i64) -> Vec<(String, i64)> {
+        let now_sec = Utc::now().timestamp();
+        let start_sec = now_sec - duration_secs;
+        let prefix = &self.redis_prefix;
 
-        for entry in self.sliding_windows.iter() {
-            if entry.key().starts_with("total:") {
-                let path = entry.key().replace("total:", "");
-                let count = entry.value().iter().filter(|t| **t > cutoff).count() as i64;
-                if count > 0 {
-                    counts.insert(path, count);
-                }
+        let Some(ref conn) = self.redis_conn else { return vec![] };
+        let mut conn = conn.clone();
+        use redis::AsyncCommands;
+
+        let paths: Vec<String> = conn
+            .smembers(format!("{}:qps:paths", prefix))
+            .await
+            .unwrap_or_default();
+
+        let mut counts: Vec<(String, i64)> = Vec::with_capacity(paths.len());
+        for path in &paths {
+            let total = self.sum_counters(prefix, path, start_sec, now_sec).await;
+            if total > 0 {
+                counts.push((path.clone(), total));
             }
         }
 
-        let mut pairs: Vec<(String, i64)> = counts.into_iter().collect();
-        pairs.sort_by(|a, b| b.1.cmp(&a.1));
-        pairs.truncate(10);
-        pairs
+        counts.sort_by(|a, b| b.1.cmp(&a.1));
+        counts.truncate(10);
+        counts
     }
 
-    pub fn get_avg_qps_across_paths(&self, duration_secs: i64) -> f64 {
-        let now = Utc::now();
-        let cutoff = now - chrono::Duration::seconds(duration_secs);
-        let mut total = 0.0;
+    pub async fn get_avg_qps_across_paths(&self, duration_secs: i64) -> f64 {
+        let now_sec = Utc::now().timestamp();
+        let start_sec = now_sec - duration_secs;
+        let prefix = &self.redis_prefix;
 
-        for entry in self.sliding_windows.iter() {
-            if entry.key().starts_with("total:") {
-                let count = entry.value().iter().filter(|t| **t > cutoff).count() as f64;
-                total += count;
-            }
+        let Some(ref conn) = self.redis_conn else { return 0.0 };
+        let mut conn = conn.clone();
+        use redis::AsyncCommands;
+
+        let paths: Vec<String> = conn
+            .smembers(format!("{}:qps:paths", prefix))
+            .await
+            .unwrap_or_default();
+
+        let mut grand_total: i64 = 0;
+        for path in &paths {
+            grand_total += self.sum_counters(prefix, path, start_sec, now_sec).await;
+        }
+        grand_total as f64 / duration_secs as f64
+    }
+
+    // ── aggregation to DB ─────────────────────────────────────────────
+
+    async fn sum_counters(&self, prefix: &str, path: &str, start_sec: i64, end_sec: i64) -> i64 {
+        let Some(ref conn) = self.redis_conn else { return 0 };
+        let mut conn = conn.clone();
+
+        let keys: Vec<String> = (start_sec..=end_sec)
+            .map(|s| format!("{}:qps:cnt:{}:{}", prefix, path, s))
+            .collect();
+
+        if keys.is_empty() {
+            return 0;
         }
 
-        total / duration_secs as f64
-    }
-
-    pub fn cleanup_old_entries(&self) {
-        let now = Utc::now();
-        let cutoff = now - chrono::Duration::hours(2);
-        self.sliding_windows.retain(|_, times| {
-            times.retain(|t| *t > cutoff);
-            !times.is_empty()
-        });
-    }
-
-    pub fn start_cleanup(self) {
-        tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(300));
-            loop {
-                ticker.tick().await;
-                self.cleanup_old_entries();
-            }
-        });
+        let result: Vec<Option<i64>> = redis::cmd("MGET")
+            .arg(&keys)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or_default();
+        result.into_iter().flatten().sum()
     }
 
     pub fn start_aggregation(self) {
@@ -140,16 +175,26 @@ impl QpsTracker {
     async fn aggregate_to_db(&self) -> Result<(), sqlx::Error> {
         let now = Utc::now();
         let one_min_ago = now - chrono::Duration::seconds(60);
+        let end_sec = now.timestamp();
+        let start_sec = one_min_ago.timestamp();
+        let prefix = &self.redis_prefix;
 
-        let entries: Vec<(String, i32)> = self
-            .sliding_windows
-            .iter()
-            .filter(|e| e.key().starts_with("total:"))
-            .map(|e| {
-                let count = e.value().iter().filter(|t| **t > one_min_ago).count() as i32;
-                (e.key().replace("total:", ""), count)
-            })
-            .collect();
+        let Some(ref conn) = self.redis_conn else { return Ok(()) };
+        let mut conn = conn.clone();
+        use redis::AsyncCommands;
+
+        let paths: Vec<String> = conn
+            .smembers(format!("{}:qps:paths", prefix))
+            .await
+            .unwrap_or_default();
+
+        let mut entries = Vec::with_capacity(paths.len());
+        for path in &paths {
+            let total = self.sum_counters(prefix, path, start_sec, end_sec).await;
+            if total > 0 {
+                entries.push((path.clone(), total as i32));
+            }
+        }
 
         if entries.is_empty() {
             return Ok(());
@@ -161,7 +206,6 @@ impl QpsTracker {
         builder.push_values(entries.iter(), |mut b, (api_path, count)| {
             b.push_bind(api_path).push_bind(*count).push_bind(now);
         });
-
         builder.build().execute(&self.pg_pool).await?;
         Ok(())
     }

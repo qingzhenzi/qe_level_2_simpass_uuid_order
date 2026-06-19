@@ -1,0 +1,28 @@
+# 全自动压测编排
+# 启动 3 个 API 实例 → 执行压测 → 输出报告
+#
+# 用法:
+#   cd /home/qingzhenzi/api.qestudio.org/qe_level_2_simpass_uuid_order
+#   docker compose -f deploy/docker-compose.bench.yml up --build
+#
+# 需要 host 网络以访问宿主机上的 PostgreSQL 和 Redis。
+
+services:
+  benchmark:
+    build:
+      dockerfile: deploy/Dockerfile.bench
+      context: ..
+    network_mode: host
+    environment:
+      PG_HOST: "127.0.0.1"
+      PG_PORT: "5432"
+      PG_USER: "qe_level_2_oder"
+      PG_PASSWORD: "4xSN5sR3hKSmhFQj"
+      PG_DBNAME: "qe_level_2_oder"
+      REDIS_URL: "redis://:redis_MQSids@127.0.0.1:6379"
+      REDIS_PREFIX: "bench"
+      INSTANCES: "3"
+      CONCURRENCY: "100"
+      REQUESTS: "5000"
+      LOG_LEVEL: "error"
+      RUST_LOG: "error"

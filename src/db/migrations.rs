@@ -8,7 +8,7 @@ const CURRENT_VERSION: i64 = 1;
 const MIGRATION_NAME: &str = "initial_setup";
 const MIGRATION_DESCRIPTION: &str = "Initial database setup with all tables and indexes";
 
-const MIGRATIONS_DIR: &str = "../../migrations";
+const MIGRATIONS_DIR: &str = "migrations";
 
 /// 运行数据库迁移
 pub async fn run_migrations(pool: &PgPool) {
@@ -116,6 +116,11 @@ fn combine_sql_files(files: &[std::path::PathBuf]) -> String {
 
 /// 确保迁移跟踪表存在并具有正确的结构
 async fn ensure_migration_table_exists(pool: &PgPool) {
+    // 首先确保 schema 存在 (水平扩展场景: 多个实例同时启动时幂等安全)
+    if let Err(e) = sqlx::raw_sql("CREATE SCHEMA IF NOT EXISTS sl_uuid").execute(pool).await {
+        error!("[MIGRATION] Failed to create schema 'sl_uuid': {}", e);
+    }
+
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'sl_uuid' AND table_name = '__migrations')"
     )

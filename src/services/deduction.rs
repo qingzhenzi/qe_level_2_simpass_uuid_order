@@ -256,28 +256,37 @@ pub async fn confirm_deduction(
     if let Some(ref mut conn) = redis_conn {
         use redis::AsyncCommands;
         let idem_key = format!("{}:processed:{}", redis_prefix, req.transaction_token);
-        let claimed: bool = conn.set_nx(&idem_key, "confirmed").await.unwrap_or(false);
-        if !claimed {
-            let tx = sqlx::query_as::<_, DeductionTransaction>(
-                "SELECT status FROM deduction_transactions WHERE transaction_token = $1"
-            )
-            .bind(req.transaction_token)
-            .fetch_optional(pg_pool)
-            .await?;
+        match conn.set_nx(&idem_key, "confirmed").await {
+            Ok(true) => {
+                // Successfully claimed — proceed
+                let _: Result<(), _> = conn.expire(&idem_key, 60).await;
+            }
+            Ok(false) => {
+                // Key already exists — check PG for actual status
+                let tx = sqlx::query_as::<_, DeductionTransaction>(
+                    "SELECT status FROM deduction_transactions WHERE transaction_token = $1"
+                )
+                .bind(req.transaction_token)
+                .fetch_optional(pg_pool)
+                .await?;
 
-            match tx {
-                Some(t) if t.status == "pending" => {
-                    return Err(AppError::Conflict("Request already being processed".into()));
-                }
-                Some(t) => {
-                    return Err(AppError::Conflict(format!("Transaction already {}", t.status)));
-                }
-                None => {
-                    return Err(AppError::NotFound("Transaction not found".into()));
+                match tx {
+                    Some(t) if t.status == "pending" => {
+                        return Err(AppError::Conflict("Request already being processed".into()));
+                    }
+                    Some(t) => {
+                        return Err(AppError::Conflict(format!("Transaction already {}", t.status)));
+                    }
+                    None => {
+                        return Err(AppError::NotFound("Transaction not found".into()));
+                    }
                 }
             }
+            Err(e) => {
+                // Redis error — skip idempotency check, let PG handle it
+                log::warn!("Redis error in confirm_deduction idempotency check (skip): {}", e);
+            }
         }
-        let _: Result<(), _> = conn.expire(&idem_key, 60).await;
     }
 
     let result = confirm_deduction_impl(pg_pool, redis_conn, redis_prefix, &req).await;
@@ -392,11 +401,17 @@ pub async fn cancel_deduction(
     if let Some(ref mut conn) = redis_conn {
         use redis::AsyncCommands;
         let idem_key = format!("{}:processed:{}", redis_prefix, req.transaction_token);
-        let claimed: bool = conn.set_nx(&idem_key, "cancelled").await.unwrap_or(false);
-        if !claimed {
-            return Err(AppError::Conflict("Request already being processed".into()));
+        match conn.set_nx(&idem_key, "cancelled").await {
+            Ok(true) => {
+                let _: Result<(), _> = conn.expire(&idem_key, 60).await;
+            }
+            Ok(false) => {
+                return Err(AppError::Conflict("Request already being processed".into()));
+            }
+            Err(e) => {
+                log::warn!("Redis error in cancel_deduction idempotency check (skip): {}", e);
+            }
         }
-        let _: Result<(), _> = conn.expire(&idem_key, 60).await;
     }
 
     let result = cancel_deduction_impl(pg_pool, redis_conn, redis_prefix, &req).await;

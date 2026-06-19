@@ -1,0 +1,37 @@
+# 自动化压测 Docker 镜像
+# 多阶段构建: 编译 Rust + 安装 hey + 运行压测
+
+# === 阶段1: 构建 Rust 二进制 ===
+FROM rust:1.86-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock* ./
+COPY src/ ./src/
+COPY migrations/ ./migrations/
+
+RUN cargo build --release --jobs $(nproc)
+
+# === 阶段2: 压测镜像 ===
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates curl procps netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 hey (HTTP 压测工具)
+RUN curl -sL https://hey-release.s3.us-east-2.amazonaws.com/hey_linux_amd64 -o /usr/local/bin/hey && \
+    chmod +x /usr/local/bin/hey
+
+# 复制二进制
+COPY --from=builder /app/target/release/qe_level_2_simpass_uuid_order /usr/local/bin/app
+
+# 复制脚本
+COPY scripts/run-bench.sh /run-bench.sh
+RUN chmod +x /run-bench.sh
+
+# 工作目录 (给运行时产生临时文件用)
+WORKDIR /tmp
+
+ENTRYPOINT ["/run-bench.sh"]

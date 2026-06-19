@@ -3,17 +3,10 @@ use sqlx::PgPool;
 use redis::aio::ConnectionManager;
 use chrono::Utc;
 use serde_json::Value;
-use std::sync::LazyLock;
-use std::sync::Mutex;
-use std::collections::HashMap;
-use std::sync::Arc;
 use crate::errors::AppError;
 use crate::models::*;
 use crate::services::qps::QpsTracker;
 use crate::config::Config;
-
-static IN_FLIGHT: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const QPS_CACHE_TTL_SECS: u64 = 30;
 
@@ -22,9 +15,9 @@ pub async fn current_qps(
     query: web::Query<std::collections::HashMap<String, String>>,
 ) -> Result<HttpResponse, AppError> {
     let api_path = query.get("api_path").map(|s| s.as_str()).unwrap_or("/api");
-    let qps = qps_tracker.get_current_qps(api_path);
-    let qps_1m = qps_tracker.get_qps_since(api_path, 60);
-    let qps_5m = qps_tracker.get_qps_since(api_path, 300);
+    let qps = qps_tracker.get_current_qps(api_path).await;
+    let qps_1m = qps_tracker.get_qps_since(api_path, 60).await;
+    let qps_5m = qps_tracker.get_qps_since(api_path, 300).await;
 
     Ok(HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
         "current_qps": qps,
@@ -104,9 +97,10 @@ pub async fn qps_stats(
     let total_key = format!("{}:total_requests", config.redis_prefix);
     let ttl = QPS_CACHE_TTL_SECS;
 
+    // total_requests: from Redis or PG
     let total: i64 = {
-        let mut redis_conn = redis_conn.get_ref().clone();
-        if let Some(ref mut conn) = redis_conn {
+        let mut conn = redis_conn.get_ref().clone();
+        if let Some(ref mut conn) = conn {
             use redis::AsyncCommands;
             let from_redis: Option<i64> = conn.get(&total_key).await.unwrap_or(None);
             match from_redis {
@@ -130,80 +124,97 @@ pub async fn qps_stats(
         }
     };
 
-    let cached: Option<String> = {
-        let mut redis_conn = redis_conn.get_ref().clone();
-        if let Some(ref mut conn) = redis_conn {
-            use redis::AsyncCommands;
-            conn.get(&cache_key).await.ok()
-        } else {
-            None
-        }
-    };
-
-    if let Some(cached) = cached {
-        if let Ok(v) = serde_json::from_str::<Value>(&cached) {
-            return Ok(HttpResponse::Ok().json(ApiResponse::success(v)));
-        }
-    }
-
-    let key_lock = {
-        let mut locks = IN_FLIGHT.lock().unwrap();
-        locks
-            .entry(cache_key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    };
-    let _guard = key_lock.lock().await;
-
-    let cached2: Option<String> = {
-        let mut redis_conn = redis_conn.get_ref().clone();
-        if let Some(ref mut conn) = redis_conn {
-            use redis::AsyncCommands;
-            conn.get(&cache_key).await.ok()
-        } else {
-            None
-        }
-    };
-
-    if let Some(cached) = cached2 {
-        if let Ok(v) = serde_json::from_str::<Value>(&cached) {
-            return Ok(HttpResponse::Ok().json(ApiResponse::success(v)));
-        }
-    }
-
-    let current_qps = tracker.get_current_qps("/");
-    let avg_1m = tracker.get_avg_qps_across_paths(60);
-    let avg_5m = tracker.get_avg_qps_across_paths(300);
-    let avg_1h = tracker.get_avg_qps_across_paths(3600);
-
-    let api_stats_raw = tracker.get_all_path_counts_since(60);
-    let api_stats: Vec<ApiQpsStats> = api_stats_raw
-        .into_iter()
-        .map(|(path, count)| ApiQpsStats {
-            api_path: path,
-            count,
-            qps: count as f64 / 60.0,
-        })
-        .collect();
-
-    let response = QpsStatsResponse {
-        current_qps,
-        avg_qps_1m: avg_1m,
-        avg_qps_5m: avg_5m,
-        avg_qps_1h: avg_1h,
-        total_requests: total,
-        api_stats,
-    };
-
+    // Check cache
     {
-        let mut redis_conn = redis_conn.get_ref().clone();
-        if let Some(ref mut conn) = redis_conn {
+        let mut conn = redis_conn.get_ref().clone();
+        if let Some(ref mut conn) = conn {
             use redis::AsyncCommands;
-            if let Ok(json) = serde_json::to_string(&response) {
-                let _: Result<(), _> = conn.set_ex(&cache_key, json, ttl).await;
+            if let Ok(cached) = conn.get::<_, String>(&cache_key).await {
+                if let Ok(v) = serde_json::from_str::<Value>(&cached) {
+                    return Ok(HttpResponse::Ok().json(ApiResponse::success(v)));
+                }
             }
         }
     }
 
+    // Distributed lock: only one instance computes stats at a time
+    // Uses Redis SET NX so across N instances only one does the work
+    let lock_key = format!("{}:qps:stats:lock", config.redis_prefix);
+    {
+        let mut conn = redis_conn.get_ref().clone();
+        let got_lock = if let Some(ref mut conn) = conn {
+            use redis::AsyncCommands;
+            match conn.set_nx(&lock_key, "1").await {
+                Ok(true) => {
+                    let _: Result<(), _> = conn.expire(&lock_key, ttl as i64).await;
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            true // no Redis — always compute
+        };
+
+        if got_lock {
+            // Re-check cache under lock
+            let mut conn = redis_conn.get_ref().clone();
+            if let Some(ref mut conn) = conn {
+                use redis::AsyncCommands;
+                if let Ok(cached) = conn.get::<_, String>(&cache_key).await {
+                    if let Ok(v) = serde_json::from_str::<Value>(&cached) {
+                        let _: Result<(), _> = conn.del(&lock_key).await;
+                        return Ok(HttpResponse::Ok().json(ApiResponse::success(v)));
+                    }
+                }
+            }
+
+            let current_qps = tracker.get_current_qps("/").await;
+            let avg_1m = tracker.get_avg_qps_across_paths(60).await;
+            let avg_5m = tracker.get_avg_qps_across_paths(300).await;
+            let avg_1h = tracker.get_avg_qps_across_paths(3600).await;
+
+            let api_stats_raw = tracker.get_all_path_counts_since(60).await;
+            let api_stats: Vec<ApiQpsStats> = api_stats_raw
+                .into_iter()
+                .map(|(path, count)| ApiQpsStats {
+                    api_path: path,
+                    count,
+                    qps: count as f64 / 60.0,
+                })
+                .collect();
+
+            let response = QpsStatsResponse {
+                current_qps,
+                avg_qps_1m: avg_1m,
+                avg_qps_5m: avg_5m,
+                avg_qps_1h: avg_1h,
+                total_requests: total,
+                api_stats,
+            };
+
+            {
+                let mut conn = redis_conn.get_ref().clone();
+                if let Some(ref mut conn) = conn {
+                    use redis::AsyncCommands;
+                    if let Ok(json) = serde_json::to_string(&response) {
+                        let _: Result<(), _> = conn.set_ex(&cache_key, json, ttl).await;
+                    }
+                    let _: Result<(), _> = conn.del(&lock_key).await;
+                }
+            }
+
+            return Ok(HttpResponse::Ok().json(ApiResponse::success(response)));
+        }
+    }
+
+    // Didn't get lock — another instance is computing. Return a minimal response
+    let response = QpsStatsResponse {
+        current_qps: 0,
+        avg_qps_1m: 0.0,
+        avg_qps_5m: 0.0,
+        avg_qps_1h: 0.0,
+        total_requests: total,
+        api_stats: vec![],
+    };
     Ok(HttpResponse::Ok().json(ApiResponse::success(response)))
 }

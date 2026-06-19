@@ -101,7 +101,7 @@ async fn rate_limit_middleware(
         .map(|s| s.to_string());
 
     if let Some(ref tracker) = qps_tracker {
-        tracker.record_request(&api_path, dev_uuid.as_deref());
+        tracker.record_request(&api_path, dev_uuid.as_deref()).await;
     }
 
     if let Some(Some(conn)) = redis_conn.map(|d| d.get_ref()) {
@@ -213,9 +213,13 @@ async fn main() -> std::io::Result<()> {
 
     health_checker_for_start.start_health_check();
 
-    let qps_tracker = services::qps::QpsTracker::new(pg_pool.clone());
-    qps_tracker.clone().start_cleanup();
+    let qps_tracker = services::qps::QpsTracker::new(
+        pg_pool.clone(),
+        redis_conn.clone(),
+        cfg.redis_prefix.clone(),
+    );
     qps_tracker.clone().start_aggregation();
+    // NOTE: cleanup is handled by Redis TTL (7200s on each counter key)
 
     tasks::start_expiration_task(pg_pool.clone(), redis_conn.clone(), cfg.redis_prefix.clone());
 
