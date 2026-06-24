@@ -12,6 +12,7 @@ pub struct RedisCache {
     prefix: String,
 }
 
+#[allow(dead_code)]
 impl RedisCache {
     pub fn new(conn: Option<ConnectionManager>, prefix: String) -> Self {
         Self { conn, prefix }
@@ -77,6 +78,32 @@ impl RedisCache {
             pending
         } else {
             0
+        }
+    }
+
+    pub async fn add_pending(
+        &mut self,
+        dev_uuid: Uuid,
+        amount: i64,
+        ttl_secs: u64,
+    ) {
+        let key = self.pending_key(dev_uuid);
+        if let Some(ref mut conn) = self.conn {
+            use redis::AsyncCommands;
+            let _: Result<i64, _> = conn.incr(&key, amount).await;
+            let _: Result<(), _> = conn.expire(&key, ttl_secs as i64).await;
+        }
+    }
+
+    pub async fn remove_pending(
+        &mut self,
+        dev_uuid: Uuid,
+        amount: i64,
+    ) {
+        let key = self.pending_key(dev_uuid);
+        if let Some(ref mut conn) = self.conn {
+            use redis::AsyncCommands;
+            let _: Result<i64, _> = conn.decr(&key, amount).await;
         }
     }
 

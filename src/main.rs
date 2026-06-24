@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod errors;
 mod handlers;
+mod middleware;
 mod models;
 mod repositories;
 mod services;
@@ -14,6 +15,7 @@ use actix_cors::Cors;
 use redis::aio::ConnectionManager;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use crate::config::Config;
 
 struct AppState {
     #[allow(dead_code)]
@@ -34,132 +36,6 @@ async fn not_found() -> HttpResponse {
         "code": "NOT_FOUND",
         "message": "Resource not found"
     }))
-}
-
-async fn admin_auth_middleware(
-    req: actix_web::dev::ServiceRequest,
-    next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
-) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
-    use actix_web::HttpResponse;
-    let path = req.path();
-    const ADMIN_PATHS: [&str; 6] = [
-        "/api/developers",
-        "/api/deductions/transactions",
-        "/api/qps/current",
-        "/api/qps/history",
-        "/api/qps/stats",
-        "/api/system/configs",
-    ];
-    
-    let is_admin = ADMIN_PATHS.iter().any(|&p| path.starts_with(p));
-    
-    if is_admin {
-        let config = req.app_data::<actix_web::web::Data<config::Config>>();
-        if let Some(cfg) = config {
-            if let Some(env_token) = &cfg.admin_api_token {
-                let token_ok = req.headers()
-                    .get("X-Admin-Token")
-                    .and_then(|h| h.to_str().ok())
-                    == Some(env_token.as_str());
-                
-                if !token_ok {
-                    let response = HttpResponse::Unauthorized()
-                        .json(serde_json::json!({
-                            "code": "UNAUTHORIZED",
-                            "message": "Invalid Admin Token"
-                        }));
-                    let (req_parts, _) = req.into_parts();
-                    return Ok(actix_web::dev::ServiceResponse::new(req_parts, response.map_into_boxed_body()));
-                }
-            }
-        }
-    }
-
-    let res = next.call(req).await?;
-    Ok(res.map_into_boxed_body())
-}
-
-async fn rate_limit_middleware(
-    req: actix_web::dev::ServiceRequest,
-    next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
-) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
-    use actix_web::HttpResponse;
-
-    let redis_conn = req.app_data::<actix_web::web::Data<Option<ConnectionManager>>>();
-    let qps_tracker = req.app_data::<actix_web::web::Data<crate::services::qps::QpsTracker>>();
-    let redis_prefix = req
-        .app_data::<actix_web::web::Data<config::Config>>()
-        .map(|c| c.redis_prefix.clone())
-        .unwrap_or_else(|| "sl:uuid".to_string());
-    let default_limit = 50000;
-
-    let api_path = req.path().to_string();
-    let dev_uuid = req
-        .headers()
-        .get("X-Developer-UUID")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    if let Some(ref tracker) = qps_tracker {
-        tracker.record_request(&api_path, dev_uuid.as_deref()).await;
-    }
-
-    if let Some(Some(conn)) = redis_conn.map(|d| d.get_ref()) {
-        let mut conn = conn.clone();
-        let total_key = format!("{}:total_requests", redis_prefix);
-        let incr_expire_script = r#"
-            local key = KEYS[1]
-            local ttl = tonumber(ARGV[1])
-            local current = redis.call('INCR', key)
-            if current == 1 then
-                redis.call('EXPIRE', key, ttl)
-            end
-            return current
-        "#;
-        let _: Result<i64, _> = redis::cmd("EVAL")
-            .arg(incr_expire_script)
-            .arg(1)
-            .arg(&total_key)
-            .arg(86400)
-            .query_async(&mut conn)
-            .await;
-
-        if let Some(ref uuid) = dev_uuid {
-            let key = format!("{}:ratelimit:{}", redis_prefix, uuid);
-            let script = r#"
-                local key = KEYS[1]
-                local limit = tonumber(ARGV[1])
-                local current = tonumber(redis.call('GET', key) or '0')
-                if current >= limit then
-                    return 0
-                end
-                redis.call('INCR', key)
-                redis.call('EXPIRE', key, 1)
-                return 1
-            "#;
-            let result: i64 = redis::cmd("EVAL")
-                .arg(script)
-                .arg(1)
-                .arg(&key)
-                .arg(default_limit)
-                .query_async(&mut conn)
-                .await
-                .unwrap_or(0);
-
-            if result == 0 {
-                let response = HttpResponse::TooManyRequests()
-                    .json(serde_json::json!({
-                        "code": "RATE_LIMITED",
-                        "message": "Rate limit exceeded"
-                    }));
-                let (req_parts, _) = req.into_parts();
-                return Ok(actix_web::dev::ServiceResponse::new(req_parts, response.map_into_boxed_body()));
-            }
-        }
-    }
-
-    let res = next.call(req).await?;
-    Ok(res.map_into_boxed_body())
 }
 
 #[actix_web::main]
@@ -274,4 +150,132 @@ async fn main() -> std::io::Result<()> {
     .bind(&bind_addr)?
     .run()
     .await
+}
+
+// ── 中间件函数 ──────────────────────────────────────────────
+
+async fn admin_auth_middleware(
+    req: actix_web::dev::ServiceRequest,
+    next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
+) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
+    use actix_web::HttpResponse;
+    let path = req.path();
+    const ADMIN_PATHS: [&str; 6] = [
+        "/api/developers",
+        "/api/deductions/transactions",
+        "/api/qps/current",
+        "/api/qps/history",
+        "/api/qps/stats",
+        "/api/system/configs",
+    ];
+
+    let is_admin = ADMIN_PATHS.iter().any(|&p| path.starts_with(p));
+
+    if is_admin {
+        let config = req.app_data::<actix_web::web::Data<Config>>();
+        if let Some(cfg) = config {
+            if let Some(env_token) = &cfg.admin_api_token {
+                let token_ok = req.headers()
+                    .get("X-Admin-Token")
+                    .and_then(|h| h.to_str().ok())
+                    == Some(env_token.as_str());
+
+                if !token_ok {
+                    let response = HttpResponse::Unauthorized()
+                        .json(serde_json::json!({
+                            "code": "UNAUTHORIZED",
+                            "message": "Invalid Admin Token"
+                        }));
+                    let (req_parts, _) = req.into_parts();
+                    return Ok(actix_web::dev::ServiceResponse::new(req_parts, response.map_into_boxed_body()));
+                }
+            }
+        }
+    }
+
+    let res = next.call(req).await?;
+    Ok(res.map_into_boxed_body())
+}
+
+async fn rate_limit_middleware(
+    req: actix_web::dev::ServiceRequest,
+    next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
+) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
+    use actix_web::HttpResponse;
+
+    let redis_conn = req.app_data::<actix_web::web::Data<Option<ConnectionManager>>>();
+    let qps_tracker = req.app_data::<actix_web::web::Data<crate::services::qps::QpsTracker>>();
+    let redis_prefix = req
+        .app_data::<actix_web::web::Data<Config>>()
+        .map(|c| c.redis_prefix.clone())
+        .unwrap_or_else(|| "sl:uuid".to_string());
+    let default_limit = 50000;
+
+    let api_path = req.path().to_string();
+    let dev_uuid = req
+        .headers()
+        .get("X-Developer-UUID")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    if let Some(ref tracker) = qps_tracker {
+        tracker.record_request(&api_path, dev_uuid.as_deref()).await;
+    }
+
+    if let Some(Some(conn)) = redis_conn.map(|d| d.get_ref()) {
+        let mut conn = conn.clone();
+        let total_key = format!("{}:total_requests", redis_prefix);
+        let incr_expire_script = r#"
+            local key = KEYS[1]
+            local ttl = tonumber(ARGV[1])
+            local current = redis.call('INCR', key)
+            if current == 1 then
+                redis.call('EXPIRE', key, ttl)
+            end
+            return current
+        "#;
+        let _: Result<i64, _> = redis::cmd("EVAL")
+            .arg(incr_expire_script)
+            .arg(1)
+            .arg(&total_key)
+            .arg(86400)
+            .query_async(&mut conn)
+            .await;
+
+        if let Some(ref uuid) = dev_uuid {
+            let key = format!("{}:ratelimit:{}", redis_prefix, uuid);
+            let script = r#"
+                local key = KEYS[1]
+                local limit = tonumber(ARGV[1])
+                local current = tonumber(redis.call('GET', key) or '0')
+                if current >= limit then
+                    return 0
+                end
+                redis.call('INCR', key)
+                redis.call('EXPIRE', key, 1)
+                return 1
+            "#;
+            let result: i64 = redis::cmd("EVAL")
+                .arg(script)
+                .arg(1)
+                .arg(&key)
+                .arg(default_limit)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(0);
+
+            if result == 0 {
+                let response = HttpResponse::TooManyRequests()
+                    .json(serde_json::json!({
+                        "code": "RATE_LIMITED",
+                        "message": "Rate limit exceeded"
+                    }));
+                let (req_parts, _) = req.into_parts();
+                return Ok(actix_web::dev::ServiceResponse::new(req_parts, response.map_into_boxed_body()));
+            }
+        }
+    }
+
+    let res = next.call(req).await?;
+    Ok(res.map_into_boxed_body())
 }

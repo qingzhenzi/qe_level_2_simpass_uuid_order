@@ -9,12 +9,11 @@ const http = axios.create({
 
 // 从 localStorage 读取 Admin Token
 const ADMIN_TOKEN_KEY = 'admin_token'
-const DEFAULT_ADMIN_TOKEN = 'admin123secure'
 
-// 自动添加 Admin Token 到请求头
+// 自动添加 Admin Token 到请求头（仅当已配置时）
 http.interceptors.request.use(
   config => {
-    const token = localStorage.getItem(ADMIN_TOKEN_KEY) || DEFAULT_ADMIN_TOKEN
+    const token = localStorage.getItem(ADMIN_TOKEN_KEY)
     if (token) {
       config.headers['X-Admin-Token'] = token
     }
@@ -45,7 +44,7 @@ export function setAdminToken(token) {
 }
 
 export function getAdminToken() {
-  return localStorage.getItem(ADMIN_TOKEN_KEY) || DEFAULT_ADMIN_TOKEN
+  return localStorage.getItem(ADMIN_TOKEN_KEY)
 }
 
 export function getDevelopers(params) {

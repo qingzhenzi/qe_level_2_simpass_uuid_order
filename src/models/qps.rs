@@ -20,6 +20,7 @@ pub struct QpsStatsResponse {
     pub avg_qps_1h: f64,
     pub total_requests: i64,
     pub api_stats: Vec<ApiQpsStats>,
+    pub aggregation_errors: u64,
 }
 
 #[derive(Debug, Serialize)]

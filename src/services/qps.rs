@@ -1,6 +1,8 @@
 use chrono::Utc;
 use sqlx::PgPool;
 use redis::aio::ConnectionManager;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::time::{interval, Duration};
 
 /// Redis-based QPS tracker — shared across instances via per-second counters.
@@ -16,6 +18,7 @@ pub struct QpsTracker {
     pg_pool: PgPool,
     redis_conn: Option<ConnectionManager>,
     redis_prefix: String,
+    aggregation_errors: Arc<AtomicU64>,
 }
 
 impl QpsTracker {
@@ -28,7 +31,12 @@ impl QpsTracker {
             pg_pool,
             redis_conn,
             redis_prefix,
+            aggregation_errors: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn aggregation_errors(&self) -> u64 {
+        self.aggregation_errors.load(Ordering::Relaxed)
     }
 
     // ── record ────────────────────────────────────────────────────────
@@ -161,12 +169,14 @@ impl QpsTracker {
     }
 
     pub fn start_aggregation(self) {
+        let errors = self.aggregation_errors.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(60));
             loop {
                 ticker.tick().await;
                 if let Err(e) = self.aggregate_to_db().await {
                     log::error!("QPS aggregation error: {}", e);
+                    errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
         });

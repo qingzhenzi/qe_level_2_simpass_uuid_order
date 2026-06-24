@@ -1,6 +1,6 @@
 use actix_web::{web, HttpResponse};
 use sqlx::PgPool;
-use crate::models::{ApiResponse, system_config::{SystemConfig, CreateSystemConfigRequest, UpdateSystemConfigRequest}};
+use crate::models::{ApiResponse, system_config::{CreateSystemConfigRequest, UpdateSystemConfigRequest}};
 use crate::services::system_config;
 use crate::errors::AppError;
 

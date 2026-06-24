@@ -35,14 +35,32 @@
     <el-container>
       <el-header style="background: #fff; border-bottom: 1px solid #e6e6e6; display: flex; align-items: center; justify-content: space-between">
         <span style="font-size: 16px; font-weight: 500">{{ pageTitle }}</span>
-        <el-tag :type="healthStatus === 'healthy' ? 'success' : 'danger'" size="small">
-          {{ healthStatus === 'healthy' ? '服务正常' : '服务异常' }}
-        </el-tag>
+        <div style="display: flex; align-items: center; gap: 12px">
+          <el-tag :type="healthStatus === 'healthy' ? 'success' : 'danger'" size="small">
+            {{ healthStatus === 'healthy' ? '服务正常' : '服务异常' }}
+          </el-tag>
+          <el-button size="small" @click="showTokenDialog = true">
+            {{ hasToken ? '更换 Token' : '设置 Token' }}
+          </el-button>
+        </div>
       </el-header>
       <el-main style="background-color: #f0f2f5">
         <router-view />
       </el-main>
     </el-container>
+
+    <!-- Token 输入对话框 -->
+    <el-dialog v-model="showTokenDialog" title="Admin Token" width="420px" :close-on-click-modal="false">
+      <el-form label-width="100px">
+        <el-form-item label="Admin Token">
+          <el-input v-model="tokenInput" type="password" show-password placeholder="请输入 Admin Token" @keyup.enter="saveToken" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showTokenDialog = false">取消</el-button>
+        <el-button type="primary" @click="saveToken" :disabled="!tokenInput.trim()">保存</el-button>
+      </template>
+    </el-dialog>
   </el-container>
 </template>
 
@@ -50,12 +68,17 @@
 import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import axios from 'axios'
+import { getAdminToken, setAdminToken } from './api'
 
 const route = useRoute()
 const healthStatus = ref('healthy')
+const showTokenDialog = ref(false)
+const tokenInput = ref('')
 let healthTimer = null
 
 const currentRoute = computed(() => route.path)
+
+const hasToken = computed(() => !!getAdminToken())
 
 const pageTitle = computed(() => {
   const titles = {
@@ -66,6 +89,14 @@ const pageTitle = computed(() => {
   }
   return titles[route.path] || 'SimPass UUID Order'
 })
+
+function saveToken() {
+  if (tokenInput.value.trim()) {
+    setAdminToken(tokenInput.value.trim())
+    showTokenDialog = false
+    tokenInput.value = ''
+  }
+}
 
 async function checkHealth() {
   try {

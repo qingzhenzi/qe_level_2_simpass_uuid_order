@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc, Duration};
 use crate::models::{DeductionTransaction, ConfirmDeductionRequest};
 use crate::errors::AppError;
 
+#[allow(dead_code)]
 pub struct TransactionRepository<'a> {
     pool: &'a PgPool,
 }
@@ -13,6 +14,7 @@ impl<'a> TransactionRepository<'a> {
         Self { pool }
     }
 
+    #[allow(dead_code)]
     pub async fn create(
         &self,
         developer_uuid: Uuid,
@@ -49,6 +51,7 @@ impl<'a> TransactionRepository<'a> {
         Ok(tx)
     }
 
+    #[allow(dead_code)]
     pub async fn confirm(&self, tx_token: Uuid) -> Result<(), AppError> {
         sqlx::query(
             "UPDATE deduction_transactions SET status = 'committed', confirmed_at = NOW() 
@@ -60,6 +63,7 @@ impl<'a> TransactionRepository<'a> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn cancel(&self, tx_token: Uuid) -> Result<bool, AppError> {
         let result = sqlx::query(
             "UPDATE deduction_transactions SET status = 'cancelled' 
@@ -71,6 +75,7 @@ impl<'a> TransactionRepository<'a> {
         Ok(result.rows_affected() > 0)
     }
 
+    #[allow(dead_code)]
     pub async fn expire_stale(&self) -> Result<u64, AppError> {
         let result = sqlx::query(
             "UPDATE deduction_transactions SET status = 'expired' 
@@ -90,8 +95,8 @@ impl<'a> TransactionRepository<'a> {
     ) -> Result<(Vec<DeductionTransaction>, i64), AppError> {
         let offset = (page - 1) * page_size;
 
-        let (count_query, data_query) = if let Some(uuid) = dev_uuid {
-            if let Some(s) = status {
+        let (count_query, data_query) = if let Some(_uuid) = dev_uuid {
+            if let Some(_s) = status {
                 (
                     "SELECT COUNT(*) FROM deduction_transactions WHERE developer_uuid = $1 AND status = $2",
                     "SELECT * FROM deduction_transactions WHERE developer_uuid = $1 AND status = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4"
@@ -103,7 +108,7 @@ impl<'a> TransactionRepository<'a> {
                 )
             }
         } else {
-            if let Some(s) = status {
+            if let Some(_s) = status {
                 (
                     "SELECT COUNT(*) FROM deduction_transactions WHERE status = $1",
                     "SELECT * FROM deduction_transactions WHERE status = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"
@@ -139,6 +144,7 @@ impl<'a> TransactionRepository<'a> {
         Ok((txs, count.0))
     }
 
+    #[allow(dead_code)]
     pub async fn validate_for_confirm(
         &self,
         req: &ConfirmDeductionRequest,
@@ -168,6 +174,7 @@ impl<'a> TransactionRepository<'a> {
         Ok(tx)
     }
 
+    #[allow(dead_code)]
     pub async fn validate_for_cancel(&self, tx_token: Uuid) -> Result<DeductionTransaction, AppError> {
         let tx = self.get_by_token(tx_token).await?
             .ok_or_else(|| AppError::NotFound("Transaction not found".into()))?;

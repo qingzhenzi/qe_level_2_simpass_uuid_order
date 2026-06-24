@@ -1,9 +1,9 @@
 use sqlx::PgPool;
 use uuid::Uuid;
-use chrono::Utc;
 use crate::models::Developer;
 use crate::errors::AppError;
 
+#[allow(dead_code)]
 pub struct DeveloperRepository<'a> {
     pool: &'a PgPool,
 }
@@ -13,6 +13,7 @@ impl<'a> DeveloperRepository<'a> {
         Self { pool }
     }
 
+    #[allow(dead_code)]
     pub async fn get_by_uuid(&self, dev_uuid: Uuid) -> Result<Option<Developer>, AppError> {
         let dev = sqlx::query_as::<_, Developer>(
             "SELECT * FROM developers WHERE developer_uuid = $1"
@@ -51,6 +52,7 @@ impl<'a> DeveloperRepository<'a> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn deduct_with_transaction(
         &self,
         dev_uuid: Uuid,

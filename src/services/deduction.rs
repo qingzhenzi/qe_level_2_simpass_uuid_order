@@ -8,34 +8,19 @@ use crate::models::{
     DeductionTransaction, InitiateDeductionResponse,
     ConfirmDeductionRequest, CancelDeductionRequest, Developer,
 };
+use crate::cache::RedisCache;
 
-const DEDUCTION_AVAILABLE_FIELD: &str = "deduction_available";
-const DEDUCTION_LIMIT_FIELD: &str = "deduction_limit";
-
-fn redis_dev_key(redis_prefix: &str, dev_uuid: Uuid) -> String {
-    format!("{}:dev:{}", redis_prefix, dev_uuid)
+fn make_cache(redis_conn: &mut Option<ConnectionManager>, prefix: &str) -> RedisCache {
+    RedisCache::new(redis_conn.clone(), prefix.to_string())
 }
 
-fn redis_pending_key(redis_prefix: &str, dev_uuid: Uuid) -> String {
-    format!("{}:dev:{}:pending", redis_prefix, dev_uuid)
-}
-
-pub async fn get_or_sync_deduction_from_redis(
+async fn get_or_sync_deduction(
+    cache: &mut RedisCache,
     pg_pool: &PgPool,
-    redis_conn: &mut Option<ConnectionManager>,
-    redis_prefix: &str,
     dev_uuid: Uuid,
 ) -> Result<(i32, i32), AppError> {
-    let redis_key = redis_dev_key(redis_prefix, dev_uuid);
-
-    if let Some(ref mut conn) = redis_conn {
-        use redis::AsyncCommands;
-        let available: Option<i32> = conn.hget(&redis_key, DEDUCTION_AVAILABLE_FIELD).await.ok().flatten();
-        let limit: Option<i32> = conn.hget(&redis_key, DEDUCTION_LIMIT_FIELD).await.ok().flatten();
-
-        if let (Some(avail), Some(lim)) = (available, limit) {
-            return Ok((avail, lim));
-        }
+    if let Some((avail, lim)) = cache.get_deduction_data(dev_uuid).await {
+        return Ok((avail, lim));
     }
 
     let dev = sqlx::query_as::<_, Developer>(
@@ -46,112 +31,13 @@ pub async fn get_or_sync_deduction_from_redis(
     .await?
     .ok_or_else(|| AppError::NotFound("Developer not found".into()))?;
 
-    if let Some(ref mut conn) = redis_conn {
-        use redis::AsyncCommands;
-        let _: Result<(), _> = conn.hset_multiple(&redis_key, &[
-            (DEDUCTION_AVAILABLE_FIELD, dev.deduction_available as i64),
-            (DEDUCTION_LIMIT_FIELD, dev.deduction_limit as i64),
-        ]).await;
-        log::info!("Synced deduction data to Redis for dev: {}", dev_uuid);
-    }
+    cache.set_deduction_data(dev_uuid, dev.deduction_available, dev.deduction_limit).await;
+    log::info!("Synced deduction data to Redis for dev: {}", dev_uuid);
 
     Ok((dev.deduction_available, dev.deduction_limit))
 }
 
-pub async fn get_pending_amount_from_redis(
-    redis_conn: &mut Option<ConnectionManager>,
-    redis_prefix: &str,
-    dev_uuid: Uuid,
-) -> i32 {
-    if let Some(ref mut conn) = redis_conn {
-        use redis::AsyncCommands;
-        let pending_key = redis_pending_key(redis_prefix, dev_uuid);
-        let pending: i64 = conn.get(&pending_key).await.unwrap_or(0);
-        return pending as i32;
-    }
-    0
-}
-
-pub async fn add_pending_to_redis(
-    redis_conn: &mut Option<ConnectionManager>,
-    redis_prefix: &str,
-    dev_uuid: Uuid,
-    amount: i32,
-    timeout_secs: u64,
-) {
-    if let Some(ref mut conn) = redis_conn {
-        use redis::AsyncCommands;
-        let pending_key = redis_pending_key(redis_prefix, dev_uuid);
-        let _: Result<i64, _> = conn.incr(&pending_key, amount).await;
-        let _: Result<(), _> = conn.expire(&pending_key, timeout_secs as i64).await;
-    }
-}
-
-pub async fn remove_pending_from_redis(
-    redis_conn: &mut Option<ConnectionManager>,
-    redis_prefix: &str,
-    dev_uuid: Uuid,
-    amount: i32,
-) {
-    if let Some(ref mut conn) = redis_conn {
-        use redis::AsyncCommands;
-        let pending_key = redis_pending_key(redis_prefix, dev_uuid);
-        let _: Result<i64, _> = conn.decr(&pending_key, amount).await;
-    }
-}
-
-pub async fn deduct_from_redis(
-    redis_conn: &mut Option<ConnectionManager>,
-    redis_prefix: &str,
-    dev_uuid: Uuid,
-    amount: i32,
-) -> Result<(bool, i32), AppError> {
-    if let Some(ref mut conn) = redis_conn {
-        let redis_key = redis_dev_key(redis_prefix, dev_uuid);
-
-        let script = r#"
-            local key = KEYS[1]
-            local amount = tonumber(ARGV[1])
-            local current = tonumber(redis.call('HGET', key, 'deduction_available'))
-            if current == nil then
-                return {-1, 0}
-            end
-            if current < amount then
-                return {0, current}
-            end
-            local new_val = current - amount
-            redis.call('HSET', key, 'deduction_available', new_val)
-            return {1, new_val}
-        "#;
-
-        let result: (i64, i64) = redis::cmd("EVAL")
-            .arg(script)
-            .arg(1)
-            .arg(&redis_key)
-            .arg(amount)
-            .query_async(conn)
-            .await
-            .map_err(|e| AppError::RedisError(e.to_string()))?;
-
-        match result.0 {
-            1 => {
-                log::info!("Deducted {} from Redis for dev {}, new value: {}", amount, dev_uuid, result.1);
-                return Ok((true, result.1 as i32));
-            }
-            0 => {
-                return Ok((false, result.1 as i32));
-            }
-            -1 => {
-                log::warn!("Deduction data not in Redis for dev {}, need sync", dev_uuid);
-                return Ok((false, 0));
-            }
-            _ => return Ok((false, 0)),
-        }
-    }
-    Ok((false, 0))
-}
-
-pub async fn sync_deduction_to_pg(
+async fn sync_deduction_to_pg(
     pg_pool: &PgPool,
     dev_uuid: Uuid,
     new_available: i32,
@@ -176,18 +62,11 @@ pub async fn initiate_deduction(
     amount: i32,
     timeout_secs: u64,
 ) -> Result<InitiateDeductionResponse, AppError> {
-    let (available, limit) = get_or_sync_deduction_from_redis(
-        pg_pool,
-        redis_conn,
-        redis_prefix,
-        developer_uuid,
-    ).await?;
+    let mut cache = make_cache(redis_conn, redis_prefix);
 
-    let pending_amount = get_pending_amount_from_redis(
-        redis_conn,
-        redis_prefix,
-        developer_uuid,
-    ).await;
+    let (available, limit) = get_or_sync_deduction(&mut cache, pg_pool, developer_uuid).await?;
+
+    let pending_amount = cache.get_pending_count(developer_uuid).await as i32;
 
     if available - pending_amount < amount {
         return Err(AppError::BadRequest(format!(
@@ -214,13 +93,7 @@ pub async fn initiate_deduction(
     .execute(pg_pool)
     .await?;
 
-    add_pending_to_redis(
-        redis_conn,
-        redis_prefix,
-        developer_uuid,
-        amount,
-        timeout_secs,
-    ).await;
+    cache.add_pending(developer_uuid, amount as i64, timeout_secs).await;
 
     if let Some(ref mut conn) = redis_conn {
         use redis::AsyncCommands;
@@ -258,11 +131,9 @@ pub async fn confirm_deduction(
         let idem_key = format!("{}:processed:{}", redis_prefix, req.transaction_token);
         match conn.set_nx(&idem_key, "confirmed").await {
             Ok(true) => {
-                // Successfully claimed — proceed
                 let _: Result<(), _> = conn.expire(&idem_key, 60).await;
             }
             Ok(false) => {
-                // Key already exists — check PG for actual status
                 let tx = sqlx::query_as::<_, DeductionTransaction>(
                     "SELECT status FROM deduction_transactions WHERE transaction_token = $1"
                 )
@@ -283,7 +154,6 @@ pub async fn confirm_deduction(
                 }
             }
             Err(e) => {
-                // Redis error — skip idempotency check, let PG handle it
                 log::warn!("Redis error in confirm_deduction idempotency check (skip): {}", e);
             }
         }
@@ -342,7 +212,8 @@ async fn confirm_deduction_impl(
         return Err(AppError::BadRequest("Transaction expired".into()));
     }
 
-    let (deducted, new_available) = deduct_from_redis(redis_conn, redis_prefix, tx.developer_uuid, tx.amount).await?;
+    let mut cache = make_cache(redis_conn, redis_prefix);
+    let (deducted, new_available) = cache.deduct(tx.developer_uuid, tx.amount).await?;
 
     if deducted {
         sync_deduction_to_pg(pg_pool, tx.developer_uuid, new_available).await?;
@@ -369,12 +240,7 @@ async fn confirm_deduction_impl(
 
         pg_tx.commit().await?;
 
-        let _ = get_or_sync_deduction_from_redis(
-            pg_pool,
-            redis_conn,
-            redis_prefix,
-            tx.developer_uuid,
-        ).await;
+        let _ = get_or_sync_deduction(&mut cache, pg_pool, tx.developer_uuid).await;
     }
 
     sqlx::query("UPDATE deduction_transactions SET status = 'committed', confirmed_at = NOW() WHERE id = $1")
@@ -382,7 +248,7 @@ async fn confirm_deduction_impl(
         .execute(pg_pool)
         .await?;
 
-    remove_pending_from_redis(redis_conn, redis_prefix, tx.developer_uuid, tx.amount).await;
+    cache.remove_pending(tx.developer_uuid, tx.amount as i64).await;
 
     log::info!(
         "Deduction confirmed: dev={}, amount={}, token={}",
@@ -459,7 +325,8 @@ async fn cancel_deduction_impl(
     .execute(pg_pool)
     .await?;
 
-    remove_pending_from_redis(redis_conn, redis_prefix, tx.developer_uuid, tx.amount).await;
+    let mut cache = make_cache(redis_conn, redis_prefix);
+    cache.remove_pending(tx.developer_uuid, tx.amount as i64).await;
 
     log::info!(
         "Deduction cancelled: dev={}, amount={}, token={}",
@@ -469,9 +336,10 @@ async fn cancel_deduction_impl(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn expire_stale_transactions(pg_pool: &PgPool) -> Result<u64, AppError> {
     let result = sqlx::query(
-        "UPDATE deduction_transactions SET status = 'expired' 
+        "UPDATE deduction_transactions SET status = 'expired'
          WHERE status = 'pending' AND expires_at < NOW()"
     )
     .execute(pg_pool)
@@ -480,110 +348,70 @@ pub async fn expire_stale_transactions(pg_pool: &PgPool) -> Result<u64, AppError
     Ok(result.rows_affected())
 }
 
+#[allow(dead_code)]
 pub async fn recover_deduction_for_all(
     pg_pool: &PgPool,
     redis_conn: &mut Option<ConnectionManager>,
     redis_prefix: &str,
 ) -> Result<u64, AppError> {
-    let now = Utc::now();
-    
-    let devs = sqlx::query_as::<_, Developer>(
-        "SELECT * FROM developers"
-    )
-    .fetch_all(pg_pool)
-    .await?;
+    const BATCH_SIZE: usize = 100;
+    const BATCH_TIMEOUT_SECS: u64 = 30;
 
+    let dev_repo = crate::repositories::DeveloperRepository::new(pg_pool);
+    let all_devs = dev_repo.get_all().await?;
+
+    let mut cache = make_cache(redis_conn, redis_prefix);
     let mut recovered_count = 0u64;
+    let now = Utc::now();
 
-    for dev in devs {
-        let last_recovery = dev.last_recovery_time.unwrap_or_else(|| Utc::now() - Duration::days(1));
-        let interval = Duration::seconds(dev.recovery_interval_secs as i64);
-        
-        if now - last_recovery < interval {
-            continue;
-        }
+    for chunk in all_devs.chunks(BATCH_SIZE) {
+        let batch_start = std::time::Instant::now();
 
-        let redis_key = redis_dev_key(redis_prefix, dev.developer_uuid);
+        for dev in chunk {
+            let last_recovery = dev.last_recovery_time.unwrap_or_else(|| now - Duration::days(1));
+            let interval = Duration::seconds(dev.recovery_interval_secs as i64);
 
-        let (current_available, limit) = if let Some(ref mut conn) = redis_conn {
-            use redis::AsyncCommands;
-            let avail: Option<i32> = conn.hget(&redis_key, DEDUCTION_AVAILABLE_FIELD).await.ok().flatten();
-            let lim: Option<i32> = conn.hget(&redis_key, DEDUCTION_LIMIT_FIELD).await.ok().flatten();
+            if now - last_recovery < interval {
+                continue;
+            }
 
-            if let (Some(a), Some(l)) = (avail, lim) {
-                (a, l)
+            let (current_available, limit) = if let Some((avail, lim)) = cache.get_deduction_data(dev.developer_uuid).await {
+                (avail, lim)
             } else {
                 (dev.deduction_available, dev.deduction_limit)
-            }
-        } else {
-            (dev.deduction_available, dev.deduction_limit)
-        };
+            };
 
-        if current_available >= limit {
-            continue;
+            if current_available >= limit {
+                continue;
+            }
+
+            let recovery_amount = dev.recovery_amount;
+            let new_available = std::cmp::min(current_available + recovery_amount, limit);
+
+            if new_available != current_available {
+                cache.set_deduction_data(dev.developer_uuid, new_available, limit).await;
+                if let Err(e) = dev_repo.update_deduction_available(dev.developer_uuid, new_available).await {
+                    log::error!("Error updating deduction available: {}", e);
+                }
+                if let Err(e) = dev_repo.update_last_recovery_time(dev.developer_uuid).await {
+                    log::error!("Error updating last recovery time: {}", e);
+                }
+
+                log::info!(
+                    "Recovered deduction for dev {}: {} -> {} (limit: {}, recovery: {}, interval: {}s)",
+                    dev.developer_uuid, current_available, new_available, limit, recovery_amount, dev.recovery_interval_secs
+                );
+                recovered_count += 1;
+            }
         }
 
-        let recovery_amount = dev.recovery_amount;
-        let new_available = std::cmp::min(current_available + recovery_amount, limit);
-
-        if new_available != current_available {
-            if let Some(ref mut conn) = redis_conn {
-                use redis::AsyncCommands;
-                let _: Result<(), _> = conn.hset(&redis_key, DEDUCTION_AVAILABLE_FIELD, new_available).await;
-            }
-
-            sync_deduction_to_pg(pg_pool, dev.developer_uuid, new_available).await?;
-
-            sqlx::query(
-                "UPDATE developers SET last_recovery_time = NOW() WHERE developer_uuid = $1"
-            )
-            .bind(dev.developer_uuid)
-            .execute(pg_pool)
-            .await?;
-
-            log::info!(
-                "Recovered deduction for dev {}: {} -> {} (limit: {}, recovery: {}, interval: {}s)",
-                dev.developer_uuid, current_available, new_available, limit, recovery_amount, dev.recovery_interval_secs
-            );
-            recovered_count += 1;
+        // Check batch timeout
+        if batch_start.elapsed().as_secs() >= BATCH_TIMEOUT_SECS {
+            log::warn!("Recovery batch timed out after {}s, processed {}/{} developers",
+                BATCH_TIMEOUT_SECS, recovered_count, all_devs.len());
+            break;
         }
     }
 
     Ok(recovered_count)
-}
-
-pub async fn recover_deduction_for_developer(
-    pg_pool: &PgPool,
-    redis_conn: &mut Option<ConnectionManager>,
-    redis_prefix: &str,
-    dev_uuid: Uuid,
-    recovery_amount: i32,
-) -> Result<i32, AppError> {
-    let (current_available, limit) = get_or_sync_deduction_from_redis(
-        pg_pool,
-        redis_conn,
-        redis_prefix,
-        dev_uuid,
-    ).await?;
-
-    if current_available >= limit {
-        return Ok(current_available);
-    }
-
-    let new_available = std::cmp::min(current_available + recovery_amount, limit);
-
-    if let Some(ref mut conn) = redis_conn {
-        use redis::AsyncCommands;
-        let redis_key = redis_dev_key(redis_prefix, dev_uuid);
-        let _: Result<(), _> = conn.hset(&redis_key, DEDUCTION_AVAILABLE_FIELD, new_available).await;
-    }
-
-    sync_deduction_to_pg(pg_pool, dev_uuid, new_available).await?;
-
-    log::info!(
-        "Recovered deduction for dev {}: {} -> {} (limit: {}, recovery: {})",
-        dev_uuid, current_available, new_available, limit, recovery_amount
-    );
-
-    Ok(new_available)
 }

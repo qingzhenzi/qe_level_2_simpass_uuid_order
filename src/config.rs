@@ -13,8 +13,11 @@ pub struct Config {
     pub redis_prefix: String,
     pub deduction_timeout_secs: u64,
     pub log_level: String,
+    #[allow(dead_code)]
     pub deduction_allowed_useragents: Vec<String>,
+    #[allow(dead_code)]
     pub deduction_api_token: Option<String>,
+    #[allow(dead_code)]
     pub admin_api_token: Option<String>,
 }
 

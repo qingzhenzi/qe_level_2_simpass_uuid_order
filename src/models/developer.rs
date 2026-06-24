@@ -23,11 +23,8 @@ pub struct Developer {
     pub rate_limit_per_second: i32,
     pub deduction_available: i32,
     pub deduction_limit: i32,
-    #[serde(skip_serializing)]
     pub recovery_amount: i32,
-    #[serde(skip_serializing)]
     pub recovery_interval_secs: i32,
-    #[serde(skip_serializing)]
     pub last_recovery_time: Option<DateTime<Utc>>,
 }
 

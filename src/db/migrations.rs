@@ -356,6 +356,7 @@ async fn record_migration(
 }
 
 /// 获取迁移历史记录
+#[allow(dead_code)]
 pub async fn get_migration_history(pool: &PgPool) -> Result<Vec<MigrationRecord>, sqlx::Error> {
     let mut records = Vec::new();
     
@@ -383,6 +384,7 @@ pub async fn get_migration_history(pool: &PgPool) -> Result<Vec<MigrationRecord>
 
 /// 迁移记录结构体
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MigrationRecord {
     pub id: i64,
     pub version: i64,

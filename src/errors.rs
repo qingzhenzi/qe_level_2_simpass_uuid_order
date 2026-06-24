@@ -12,7 +12,9 @@ pub enum AppError {
     ServiceUnavailable(String),
     DatabaseError(String),
     RedisError(String),
+    #[allow(dead_code)]
     Unauthorized(String),
+    #[allow(dead_code)]
     Forbidden(String),
 }
 

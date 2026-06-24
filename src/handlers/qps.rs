@@ -190,6 +190,7 @@ pub async fn qps_stats(
                 avg_qps_1h: avg_1h,
                 total_requests: total,
                 api_stats,
+                aggregation_errors: tracker.aggregation_errors(),
             };
 
             {
@@ -215,6 +216,7 @@ pub async fn qps_stats(
         avg_qps_1h: 0.0,
         total_requests: total,
         api_stats: vec![],
+        aggregation_errors: tracker.aggregation_errors(),
     };
     Ok(HttpResponse::Ok().json(ApiResponse::success(response)))
 }

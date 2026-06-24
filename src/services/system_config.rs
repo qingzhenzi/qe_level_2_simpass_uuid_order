@@ -72,6 +72,7 @@ pub async fn delete_config(pg_pool: &PgPool, key: &str) -> Result<(), AppError> 
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn get_allowed_useragents(pg_pool: &PgPool) -> Result<Vec<String>, AppError> {
     if let Some(config) = get_config(pg_pool, "deduction_allowed_useragents").await? {
         Ok(config.config_value.split(',')
@@ -83,6 +84,7 @@ pub async fn get_allowed_useragents(pg_pool: &PgPool) -> Result<Vec<String>, App
     }
 }
 
+#[allow(dead_code)]
 pub async fn get_api_token(pg_pool: &PgPool) -> Result<Option<String>, AppError> {
     if let Some(config) = get_config(pg_pool, "deduction_api_token").await? {
         if config.config_value.is_empty() {

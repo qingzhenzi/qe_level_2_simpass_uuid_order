@@ -15,10 +15,10 @@ pub async fn initiate(
     config: web::Data<Config>,
     body: web::Json<InitiateDeductionRequest>,
 ) -> Result<HttpResponse, crate::errors::AppError> {
-    let mut redis_conn = redis_conn.get_ref().clone();
+    let mut conn = redis_conn.get_ref().clone();
     let result = deduction::initiate_deduction(
         pg_pool.get_ref(),
-        &mut redis_conn,
+        &mut conn,
         &config.redis_prefix,
         body.developer_uuid,
         body.amount,
@@ -74,8 +74,8 @@ pub async fn get_transaction(
 
 pub async fn list_transactions(
     pg_pool: web::Data<PgPool>,
-    redis_conn: web::Data<Option<ConnectionManager>>,
-    config: web::Data<Config>,
+    _redis_conn: web::Data<Option<ConnectionManager>>,
+    _config: web::Data<Config>,
     query: web::Query<std::collections::HashMap<String, String>>,
 ) -> Result<HttpResponse, crate::errors::AppError> {
     let page: i64 = query.get("page").and_then(|v| v.parse().ok()).unwrap_or(1);
