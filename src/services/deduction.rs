@@ -1,70 +1,87 @@
 use chrono::{Duration, Utc};
 use uuid::Uuid;
-use sqlx::PgPool;
-use redis::aio::ConnectionManager;
-
+use crate::db::DbPool;
 use crate::errors::AppError;
 use crate::models::{
     DeductionTransaction, InitiateDeductionResponse,
     ConfirmDeductionRequest, CancelDeductionRequest, Developer,
 };
-use crate::cache::RedisCache;
-
-fn make_cache(redis_conn: &mut Option<ConnectionManager>, prefix: &str) -> RedisCache {
-    RedisCache::new(redis_conn.clone(), prefix.to_string())
-}
+use crate::cache::backend::CacheBackend;
 
 async fn get_or_sync_deduction(
-    cache: &mut RedisCache,
-    pg_pool: &PgPool,
+    cache: &mut CacheBackend,
+    db: &DbPool,
     dev_uuid: Uuid,
 ) -> Result<(i32, i32), AppError> {
     if let Some((avail, lim)) = cache.get_deduction_data(dev_uuid).await {
         return Ok((avail, lim));
     }
 
-    let dev = sqlx::query_as::<_, Developer>(
-        "SELECT * FROM developers WHERE developer_uuid = $1"
-    )
-    .bind(dev_uuid)
-    .fetch_optional(pg_pool)
-    .await?
+    let dev = match db {
+        DbPool::Postgres(pg) => {
+            sqlx::query_as::<_, Developer>(
+                "SELECT * FROM developers WHERE developer_uuid = $1"
+            )
+            .bind(dev_uuid)
+            .fetch_optional(pg)
+            .await?
+        }
+        DbPool::Sqlite(sq) => {
+            sqlx::query_as::<_, Developer>(
+                "SELECT * FROM developers WHERE developer_uuid = $1"
+            )
+            .bind(dev_uuid.to_string())
+            .fetch_optional(sq)
+            .await?
+        }
+    }
     .ok_or_else(|| AppError::NotFound("Developer not found".into()))?;
 
     cache.set_deduction_data(dev_uuid, dev.deduction_available, dev.deduction_limit).await;
-    log::info!("Synced deduction data to Redis for dev: {}", dev_uuid);
+    log::info!("Synced deduction data to cache for dev: {}", dev_uuid);
 
     Ok((dev.deduction_available, dev.deduction_limit))
 }
 
-async fn sync_deduction_to_pg(
-    pg_pool: &PgPool,
+async fn sync_deduction_to_db(
+    db: &DbPool,
     dev_uuid: Uuid,
     new_available: i32,
 ) -> Result<(), AppError> {
-    sqlx::query(
-        "UPDATE developers SET deduction_available = $1, updated_at = NOW() WHERE developer_uuid = $2"
-    )
-    .bind(new_available)
-    .bind(dev_uuid)
-    .execute(pg_pool)
-    .await?;
+    match db {
+        DbPool::Postgres(pg) => {
+            sqlx::query(
+                "UPDATE developers SET deduction_available = $1, updated_at = NOW() WHERE developer_uuid = $2"
+            )
+            .bind(new_available)
+            .bind(dev_uuid)
+            .execute(pg)
+            .await?;
+        }
+        DbPool::Sqlite(sq) => {
+            sqlx::query(
+                "UPDATE developers SET deduction_available = $1, updated_at = $2 WHERE developer_uuid = $3"
+            )
+            .bind(new_available)
+            .bind(Utc::now().to_rfc3339())
+            .bind(dev_uuid.to_string())
+            .execute(sq)
+            .await?;
+        }
+    }
 
-    log::info!("Synced deduction_available={} to PostgreSQL for dev {}", new_available, dev_uuid);
+    log::info!("Synced deduction_available={} to DB for dev {}", new_available, dev_uuid);
     Ok(())
 }
 
 pub async fn initiate_deduction(
-    pg_pool: &PgPool,
-    redis_conn: &mut Option<ConnectionManager>,
-    redis_prefix: &str,
+    db: &DbPool,
+    cache: &mut CacheBackend,
     developer_uuid: Uuid,
     amount: i32,
     timeout_secs: u64,
 ) -> Result<InitiateDeductionResponse, AppError> {
-    let mut cache = make_cache(redis_conn, redis_prefix);
-
-    let (available, limit) = get_or_sync_deduction(&mut cache, pg_pool, developer_uuid).await?;
+    let (available, limit) = get_or_sync_deduction(cache, db, developer_uuid).await?;
 
     let pending_amount = cache.get_pending_count(developer_uuid).await as i32;
 
@@ -80,37 +97,53 @@ pub async fn initiate_deduction(
     let now = Utc::now();
     let expires_at = now + Duration::seconds(timeout_secs as i64);
 
-    sqlx::query(
-        r#"INSERT INTO deduction_transactions
-           (developer_uuid, transaction_token, amount, status, expires_at, commit_token)
-           VALUES ($1, $2, $3, 'pending', $4, $5)"#
-    )
-    .bind(developer_uuid)
-    .bind(transaction_token)
-    .bind(amount)
-    .bind(expires_at)
-    .bind(commit_token)
-    .execute(pg_pool)
-    .await?;
+    match db {
+        DbPool::Postgres(pg) => {
+            sqlx::query(
+                r#"INSERT INTO deduction_transactions
+                   (developer_uuid, transaction_token, amount, status, expires_at, commit_token)
+                   VALUES ($1, $2, $3, 'pending', $4, $5)"#
+            )
+            .bind(developer_uuid)
+            .bind(transaction_token)
+            .bind(amount)
+            .bind(expires_at)
+            .bind(commit_token)
+            .execute(pg)
+            .await?;
+        }
+        DbPool::Sqlite(sq) => {
+            sqlx::query(
+                r#"INSERT INTO deduction_transactions
+                   (developer_uuid, transaction_token, amount, status, expires_at, commit_token)
+                   VALUES ($1, $2, $3, 'pending', $4, $5)"#
+            )
+            .bind(developer_uuid.to_string())
+            .bind(transaction_token.to_string())
+            .bind(amount)
+            .bind(expires_at.to_rfc3339())
+            .bind(commit_token.to_string())
+            .execute(sq)
+            .await?;
+        }
+    }
 
     cache.add_pending(developer_uuid, amount as i64, timeout_secs).await;
 
-    if let Some(ref mut conn) = redis_conn {
-        use redis::AsyncCommands;
-        let redis_key = format!("{}:deduct:{}", redis_prefix, transaction_token);
-        let redis_data = serde_json::json!({
-            "developer_uuid": developer_uuid.to_string(),
-            "amount": amount,
-            "commit_token": commit_token.to_string(),
-            "status": "pending",
-            "expires_at": expires_at.to_rfc3339(),
-        });
-        let _: Result<(), _> = conn.set_ex(
-            redis_key.as_str(),
-            redis_data.to_string(),
-            timeout_secs as u64,
-        ).await;
-    }
+    // Store transaction data in cache
+    use crate::models::DeductionTransaction;
+    let tx = DeductionTransaction {
+        id: 0,
+        developer_uuid,
+        transaction_token,
+        amount,
+        status: "pending".into(),
+        created_at: now,
+        expires_at,
+        confirmed_at: None,
+        commit_token: Some(commit_token.to_string()),
+    };
+    cache.set_transaction(&tx, timeout_secs).await;
 
     log::info!(
         "Deduction initiated: dev={}, amount={}, token={}, commit={}, available={}, limit={}",
@@ -121,73 +154,79 @@ pub async fn initiate_deduction(
 }
 
 pub async fn confirm_deduction(
-    pg_pool: &PgPool,
-    redis_conn: &mut Option<ConnectionManager>,
-    redis_prefix: &str,
+    db: &DbPool,
+    cache: &mut CacheBackend,
     req: ConfirmDeductionRequest,
 ) -> Result<(), AppError> {
-    if let Some(ref mut conn) = redis_conn {
-        use redis::AsyncCommands;
-        let idem_key = format!("{}:processed:{}", redis_prefix, req.transaction_token);
-        match conn.set_nx(&idem_key, "confirmed").await {
-            Ok(true) => {
-                let _: Result<(), _> = conn.expire(&idem_key, 60).await;
-            }
-            Ok(false) => {
-                let tx = sqlx::query_as::<_, DeductionTransaction>(
+    // Idempotency check
+    if !cache.try_claim_processed(req.transaction_token).await {
+        // Already processing — check current state
+        let tx = match db {
+            DbPool::Postgres(pg) => {
+                sqlx::query_as::<_, DeductionTransaction>(
                     "SELECT status FROM deduction_transactions WHERE transaction_token = $1"
                 )
                 .bind(req.transaction_token)
-                .fetch_optional(pg_pool)
-                .await?;
-
-                match tx {
-                    Some(t) if t.status == "pending" => {
-                        return Err(AppError::Conflict("Request already being processed".into()));
-                    }
-                    Some(t) => {
-                        return Err(AppError::Conflict(format!("Transaction already {}", t.status)));
-                    }
-                    None => {
-                        return Err(AppError::NotFound("Transaction not found".into()));
-                    }
-                }
+                .fetch_optional(pg)
+                .await?
             }
-            Err(e) => {
-                log::warn!("Redis error in confirm_deduction idempotency check (skip): {}", e);
+            DbPool::Sqlite(sq) => {
+                sqlx::query_as::<_, DeductionTransaction>(
+                    "SELECT status FROM deduction_transactions WHERE transaction_token = $1"
+                )
+                .bind(req.transaction_token.to_string())
+                .fetch_optional(sq)
+                .await?
+            }
+        };
+
+        match tx {
+            Some(t) if t.status == "pending" => {
+                return Err(AppError::Conflict("Request already being processed".into()));
+            }
+            Some(t) => {
+                return Err(AppError::Conflict(format!("Transaction already {}", t.status)));
+            }
+            None => {
+                return Err(AppError::NotFound("Transaction not found".into()));
             }
         }
     }
 
-    let result = confirm_deduction_impl(pg_pool, redis_conn, redis_prefix, &req).await;
+    let result = confirm_deduction_impl(db, cache, &req).await;
 
     if result.is_ok() {
-        if let Some(ref mut conn) = redis_conn {
-            use redis::AsyncCommands;
-            let redis_key = format!("{}:deduct:{}", redis_prefix, req.transaction_token);
-            let _: Result<(), _> = conn.del(&redis_key).await;
-        }
-    } else if let Some(ref mut conn) = redis_conn {
-        use redis::AsyncCommands;
-        let idem_key = format!("{}:processed:{}", redis_prefix, req.transaction_token);
-        let _: Result<(), _> = conn.del(&idem_key).await;
+        cache.del_transaction(req.transaction_token).await;
+    } else {
+        cache.del_processed(req.transaction_token).await;
     }
 
     result
 }
 
 async fn confirm_deduction_impl(
-    pg_pool: &PgPool,
-    redis_conn: &mut Option<ConnectionManager>,
-    redis_prefix: &str,
+    db: &DbPool,
+    cache: &mut CacheBackend,
     req: &ConfirmDeductionRequest,
 ) -> Result<(), AppError> {
-    let tx = sqlx::query_as::<_, DeductionTransaction>(
-        "SELECT * FROM deduction_transactions WHERE transaction_token = $1"
-    )
-    .bind(req.transaction_token)
-    .fetch_optional(pg_pool)
-    .await?
+    let tx = match db {
+        DbPool::Postgres(pg) => {
+            sqlx::query_as::<_, DeductionTransaction>(
+                "SELECT * FROM deduction_transactions WHERE transaction_token = $1"
+            )
+            .bind(req.transaction_token)
+            .fetch_optional(pg)
+            .await?
+        }
+        DbPool::Sqlite(sq) => {
+            sqlx::query_as::<_, DeductionTransaction>(
+                "SELECT * FROM deduction_transactions WHERE transaction_token = $1"
+            )
+            .bind(req.transaction_token.to_string())
+            .fetch_optional(sq)
+            .await?
+        }
+    }
     .ok_or_else(|| AppError::NotFound("Transaction not found".into()))?;
 
     if tx.status != "pending" {
@@ -197,56 +236,106 @@ async fn confirm_deduction_impl(
         )));
     }
 
-    let commit_token = tx.commit_token
-        .ok_or_else(|| AppError::InternalError("Missing commit token".into()))?;
+    let commit_token = Uuid::parse_str(
+        tx.commit_token.as_deref().ok_or_else(|| AppError::InternalError("Missing commit token".into()))?
+    ).map_err(|_| AppError::InternalError("Invalid commit token format".into()))?;
 
     if commit_token != req.commit_token {
         return Err(AppError::BadRequest("Invalid commit token".into()));
     }
 
     if Utc::now() > tx.expires_at {
-        sqlx::query("UPDATE deduction_transactions SET status = 'expired' WHERE id = $1")
-            .bind(tx.id)
-            .execute(pg_pool)
-            .await?;
+        match db {
+            DbPool::Postgres(pg) => {
+                sqlx::query("UPDATE deduction_transactions SET status = 'expired' WHERE id = $1")
+                    .bind(tx.id)
+                    .execute(pg)
+                    .await?;
+            }
+            DbPool::Sqlite(sq) => {
+                sqlx::query("UPDATE deduction_transactions SET status = 'expired' WHERE id = $1")
+                    .bind(tx.id)
+                    .execute(sq)
+                    .await?;
+            }
+        }
         return Err(AppError::BadRequest("Transaction expired".into()));
     }
 
-    let mut cache = make_cache(redis_conn, redis_prefix);
     let (deducted, new_available) = cache.deduct(tx.developer_uuid, tx.amount).await?;
 
     if deducted {
-        sync_deduction_to_pg(pg_pool, tx.developer_uuid, new_available).await?;
+        sync_deduction_to_db(db, tx.developer_uuid, new_available).await?;
     } else {
-        let mut pg_tx = pg_pool.begin().await?;
+        match db {
+            DbPool::Postgres(pg) => {
+                let mut tx_obj = pg.begin().await?;
 
-        let result = sqlx::query(
-            r#"UPDATE developers SET
-               deduction_available = deduction_available - $1,
-               successful_auths = successful_auths + 1,
-               last_auth_time = NOW(),
-               updated_at = NOW()
-               WHERE developer_uuid = $2 AND deduction_available >= $1"#
-        )
-        .bind(tx.amount)
-        .bind(tx.developer_uuid)
-        .execute(&mut *pg_tx)
-        .await?;
+                let result = sqlx::query(
+                    r#"UPDATE developers SET
+                       deduction_available = deduction_available - $1,
+                       successful_auths = successful_auths + 1,
+                       last_auth_time = NOW(),
+                       updated_at = NOW()
+                       WHERE developer_uuid = $2 AND deduction_available >= $1"#
+                )
+                .bind(tx.amount)
+                .bind(tx.developer_uuid)
+                .execute(&mut *tx_obj)
+                .await?;
 
-        if result.rows_affected() == 0 {
-            pg_tx.rollback().await?;
-            return Err(AppError::Conflict("Insufficient deduction available at confirm time".into()));
+                if result.rows_affected() == 0 {
+                    tx_obj.rollback().await?;
+                    return Err(AppError::Conflict("Insufficient deduction available at confirm time".into()));
+                }
+
+                tx_obj.commit().await?;
+            }
+            DbPool::Sqlite(sq) => {
+                let mut tx_obj = sq.begin().await?;
+
+                let result = sqlx::query(
+                    r#"UPDATE developers SET
+                       deduction_available = deduction_available - $1,
+                       successful_auths = successful_auths + 1,
+                       last_auth_time = $2,
+                       updated_at = $2
+                       WHERE developer_uuid = $3 AND deduction_available >= $1"#
+                )
+                .bind(tx.amount)
+                .bind(Utc::now().to_rfc3339())
+                .bind(tx.developer_uuid.to_string())
+                .execute(&mut *tx_obj)
+                .await?;
+
+                if result.rows_affected() == 0 {
+                    tx_obj.rollback().await?;
+                    return Err(AppError::Conflict("Insufficient deduction available at confirm time".into()));
+                }
+
+                tx_obj.commit().await?;
+            }
         }
 
-        pg_tx.commit().await?;
-
-        let _ = get_or_sync_deduction(&mut cache, pg_pool, tx.developer_uuid).await;
+        let _ = get_or_sync_deduction(cache, db, tx.developer_uuid).await;
     }
 
-    sqlx::query("UPDATE deduction_transactions SET status = 'committed', confirmed_at = NOW() WHERE id = $1")
-        .bind(tx.id)
-        .execute(pg_pool)
-        .await?;
+    let now_str = Utc::now().to_rfc3339();
+    match db {
+        DbPool::Postgres(pg) => {
+            sqlx::query("UPDATE deduction_transactions SET status = 'committed', confirmed_at = NOW() WHERE id = $1")
+                .bind(tx.id)
+                .execute(pg)
+                .await?;
+        }
+        DbPool::Sqlite(sq) => {
+            sqlx::query("UPDATE deduction_transactions SET status = 'committed', confirmed_at = $1 WHERE id = $2")
+                .bind(now_str)
+                .bind(tx.id)
+                .execute(sq)
+                .await?;
+        }
+    }
 
     cache.remove_pending(tx.developer_uuid, tx.amount as i64).await;
 
@@ -259,56 +348,49 @@ async fn confirm_deduction_impl(
 }
 
 pub async fn cancel_deduction(
-    pg_pool: &PgPool,
-    redis_conn: &mut Option<ConnectionManager>,
-    redis_prefix: &str,
+    db: &DbPool,
+    cache: &mut CacheBackend,
     req: CancelDeductionRequest,
 ) -> Result<(), AppError> {
-    if let Some(ref mut conn) = redis_conn {
-        use redis::AsyncCommands;
-        let idem_key = format!("{}:processed:{}", redis_prefix, req.transaction_token);
-        match conn.set_nx(&idem_key, "cancelled").await {
-            Ok(true) => {
-                let _: Result<(), _> = conn.expire(&idem_key, 60).await;
-            }
-            Ok(false) => {
-                return Err(AppError::Conflict("Request already being processed".into()));
-            }
-            Err(e) => {
-                log::warn!("Redis error in cancel_deduction idempotency check (skip): {}", e);
-            }
-        }
+    // Idempotency check
+    if !cache.try_claim_processed(req.transaction_token).await {
+        return Err(AppError::Conflict("Request already being processed".into()));
     }
 
-    let result = cancel_deduction_impl(pg_pool, redis_conn, redis_prefix, &req).await;
+    let result = cancel_deduction_impl(db, cache, &req).await;
 
     if result.is_ok() {
-        if let Some(ref mut conn) = redis_conn {
-            use redis::AsyncCommands;
-            let redis_key = format!("{}:deduct:{}", redis_prefix, req.transaction_token);
-            let _: Result<(), _> = conn.del(&redis_key).await;
-        }
-    } else if let Some(ref mut conn) = redis_conn {
-        use redis::AsyncCommands;
-        let idem_key = format!("{}:processed:{}", redis_prefix, req.transaction_token);
-        let _: Result<(), _> = conn.del(&idem_key).await;
+        cache.del_transaction(req.transaction_token).await;
+    } else {
+        cache.del_processed(req.transaction_token).await;
     }
 
     result
 }
 
 async fn cancel_deduction_impl(
-    pg_pool: &PgPool,
-    redis_conn: &mut Option<ConnectionManager>,
-    redis_prefix: &str,
+    db: &DbPool,
+    cache: &mut CacheBackend,
     req: &CancelDeductionRequest,
 ) -> Result<(), AppError> {
-    let tx = sqlx::query_as::<_, DeductionTransaction>(
-        "SELECT * FROM deduction_transactions WHERE transaction_token = $1"
-    )
-    .bind(req.transaction_token)
-    .fetch_optional(pg_pool)
-    .await?
+    let tx = match db {
+        DbPool::Postgres(pg) => {
+            sqlx::query_as::<_, DeductionTransaction>(
+                "SELECT * FROM deduction_transactions WHERE transaction_token = $1"
+            )
+            .bind(req.transaction_token)
+            .fetch_optional(pg)
+            .await?
+        }
+        DbPool::Sqlite(sq) => {
+            sqlx::query_as::<_, DeductionTransaction>(
+                "SELECT * FROM deduction_transactions WHERE transaction_token = $1"
+            )
+            .bind(req.transaction_token.to_string())
+            .fetch_optional(sq)
+            .await?
+        }
+    }
     .ok_or_else(|| AppError::NotFound("Transaction not found".into()))?;
 
     if tx.status != "pending" {
@@ -318,14 +400,25 @@ async fn cancel_deduction_impl(
         )));
     }
 
-    sqlx::query(
-        "UPDATE deduction_transactions SET status = 'cancelled' WHERE id = $1 AND status = 'pending'"
-    )
-    .bind(tx.id)
-    .execute(pg_pool)
-    .await?;
+    match db {
+        DbPool::Postgres(pg) => {
+            sqlx::query(
+                "UPDATE deduction_transactions SET status = 'cancelled' WHERE id = $1 AND status = 'pending'"
+            )
+            .bind(tx.id)
+            .execute(pg)
+            .await?;
+        }
+        DbPool::Sqlite(sq) => {
+            sqlx::query(
+                "UPDATE deduction_transactions SET status = 'cancelled' WHERE id = $1 AND status = 'pending'"
+            )
+            .bind(tx.id)
+            .execute(sq)
+            .await?;
+        }
+    }
 
-    let mut cache = make_cache(redis_conn, redis_prefix);
     cache.remove_pending(tx.developer_uuid, tx.amount as i64).await;
 
     log::info!(
@@ -336,31 +429,110 @@ async fn cancel_deduction_impl(
     Ok(())
 }
 
-#[allow(dead_code)]
-pub async fn expire_stale_transactions(pg_pool: &PgPool) -> Result<u64, AppError> {
-    let result = sqlx::query(
-        "UPDATE deduction_transactions SET status = 'expired'
-         WHERE status = 'pending' AND expires_at < NOW()"
-    )
-    .execute(pg_pool)
-    .await?;
-
-    Ok(result.rows_affected())
+pub async fn expire_stale_transactions(db: &DbPool) -> Result<u64, AppError> {
+    match db {
+        DbPool::Postgres(pg) => {
+            let result = sqlx::query(
+                "UPDATE deduction_transactions SET status = 'expired' \
+                 WHERE status = 'pending' AND expires_at < NOW()"
+            )
+            .execute(pg)
+            .await?;
+            Ok(result.rows_affected())
+        }
+        DbPool::Sqlite(sq) => {
+            let result = sqlx::query(
+                "UPDATE deduction_transactions SET status = 'expired' \
+                 WHERE status = 'pending' AND expires_at < $1"
+            )
+            .bind(Utc::now().to_rfc3339())
+            .execute(sq)
+            .await?;
+            Ok(result.rows_affected())
+        }
+    }
 }
 
-#[allow(dead_code)]
+/// Sync cache pending counts with DB: count only non-expired pending transactions.
+/// This fixes the window where expire_stale_transactions marks DB rows as expired
+/// but the cache still counts them as pending.
+pub async fn sync_pending_counts(db: &DbPool, cache: &mut CacheBackend) -> Result<(), AppError> {
+    let dev_repo = crate::repositories::DeveloperRepository::new(db.clone());
+    let all_devs = dev_repo.get_all().await?;
+
+    for dev in &all_devs {
+        let pending_amount = match db {
+            DbPool::Postgres(pg) => {
+                let row: (i64,) = sqlx::query_as(
+                    "SELECT COALESCE(SUM(amount), 0) FROM deduction_transactions \
+                     WHERE developer_uuid = $1 AND status = 'pending'"
+                )
+                .bind(dev.developer_uuid)
+                .fetch_one(pg)
+                .await?;
+                row.0
+            }
+            DbPool::Sqlite(sq) => {
+                let row: (i64,) = sqlx::query_as(
+                    "SELECT COALESCE(SUM(amount), 0) FROM deduction_transactions \
+                     WHERE developer_uuid = $1 AND status = 'pending'"
+                )
+                .bind(dev.developer_uuid.to_string())
+                .fetch_one(sq)
+                .await?;
+                row.0
+            }
+        };
+
+        if pending_amount > 0 {
+            cache.add_pending(dev.developer_uuid, pending_amount, 7200).await;
+        } else {
+            // Ensure no stale pending count in cache
+            cache.remove_pending(dev.developer_uuid, i64::MAX).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Delete expired transactions that are older than the given duration.
+/// This prevents the DB from accumulating unlimited expired rows.
+pub async fn cleanup_expired_transactions(db: &DbPool, older_than_secs: i64) -> Result<u64, AppError> {
+    let cutoff = Utc::now() - Duration::seconds(older_than_secs);
+    match db {
+        DbPool::Postgres(pg) => {
+            let result = sqlx::query(
+                "DELETE FROM deduction_transactions \
+                 WHERE status = 'expired' AND expires_at < $1"
+            )
+            .bind(cutoff)
+            .execute(pg)
+            .await?;
+            Ok(result.rows_affected())
+        }
+        DbPool::Sqlite(sq) => {
+            let result = sqlx::query(
+                "DELETE FROM deduction_transactions \
+                 WHERE status = 'expired' AND expires_at < $1"
+            )
+            .bind(cutoff.to_rfc3339())
+            .execute(sq)
+            .await?;
+            Ok(result.rows_affected())
+        }
+    }
+}
+
 pub async fn recover_deduction_for_all(
-    pg_pool: &PgPool,
-    redis_conn: &mut Option<ConnectionManager>,
-    redis_prefix: &str,
+    db: &DbPool,
+    cache: &mut CacheBackend,
 ) -> Result<u64, AppError> {
     const BATCH_SIZE: usize = 100;
     const BATCH_TIMEOUT_SECS: u64 = 30;
 
-    let dev_repo = crate::repositories::DeveloperRepository::new(pg_pool);
+    let dev_repo = crate::repositories::DeveloperRepository::new(db.clone());
     let all_devs = dev_repo.get_all().await?;
 
-    let mut cache = make_cache(redis_conn, redis_prefix);
     let mut recovered_count = 0u64;
     let now = Utc::now();
 
@@ -405,7 +577,6 @@ pub async fn recover_deduction_for_all(
             }
         }
 
-        // Check batch timeout
         if batch_start.elapsed().as_secs() >= BATCH_TIMEOUT_SECS {
             log::warn!("Recovery batch timed out after {}s, processed {}/{} developers",
                 BATCH_TIMEOUT_SECS, recovered_count, all_devs.len());
@@ -414,4 +585,55 @@ pub async fn recover_deduction_for_all(
     }
 
     Ok(recovered_count)
+}
+
+/// Rebuild cache state from DB on startup.
+/// This ensures pending counts are correct after a restart,
+/// preventing over-deduction when memory cache is empty but DB has pending transactions.
+pub async fn rebuild_cache_state(db: &DbPool, cache: &mut CacheBackend) -> Result<(), AppError> {
+    let dev_repo = crate::repositories::DeveloperRepository::new(db.clone());
+    let all_devs = dev_repo.get_all().await?;
+
+    let mut pending_map: std::collections::HashMap<Uuid, i64> = std::collections::HashMap::new();
+
+    // Scan all pending transactions in DB
+    for dev in &all_devs {
+        match db {
+            DbPool::Postgres(pg) => {
+                let txs: Vec<(i64, i32)> = sqlx::query_as(
+                    "SELECT id, amount FROM deduction_transactions WHERE developer_uuid = $1 AND status = 'pending'"
+                )
+                .bind(dev.developer_uuid)
+                .fetch_all(pg)
+                .await?;
+                let total_pending: i64 = txs.iter().map(|(_, amount)| *amount as i64).sum();
+                pending_map.insert(dev.developer_uuid, total_pending);
+            }
+            DbPool::Sqlite(sq) => {
+                let txs: Vec<(i64, i32)> = sqlx::query_as(
+                    "SELECT id, amount FROM deduction_transactions WHERE developer_uuid = $1 AND status = 'pending'"
+                )
+                .bind(dev.developer_uuid.to_string())
+                .fetch_all(sq)
+                .await?;
+                let total_pending: i64 = txs.iter().map(|(_, amount)| *amount as i64).sum();
+                pending_map.insert(dev.developer_uuid, total_pending);
+            }
+        }
+    }
+
+    // Rebuild cache
+    for dev in &all_devs {
+        let pending = pending_map.get(&dev.developer_uuid).copied().unwrap_or(0);
+        cache.set_deduction_data(dev.developer_uuid, dev.deduction_available, dev.deduction_limit).await;
+        if pending > 0 {
+            cache.add_pending(dev.developer_uuid, pending, 7200).await;
+        }
+    }
+
+    let total_pending_devs = pending_map.values().filter(|&&p| p > 0).count();
+    log::info!("[Startup] Cache state rebuilt: {} developers loaded, {} with pending transactions",
+        all_devs.len(), total_pending_devs);
+
+    Ok(())
 }

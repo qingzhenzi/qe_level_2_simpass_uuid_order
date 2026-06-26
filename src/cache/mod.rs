@@ -1,2 +1,3 @@
+pub mod backend;
+pub mod memory;
 pub mod redis;
-pub use redis::RedisCache;

@@ -1,38 +1,26 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::{interval, Duration};
-use sqlx::PgPool;
-use redis::aio::ConnectionManager;
+use crate::db::DbPool;
 
 #[derive(Clone)]
 pub struct HealthChecker {
-    pg_pool: PgPool,
-    redis_conn: Option<ConnectionManager>,
-    pg_healthy: Arc<AtomicBool>,
-    redis_healthy: Arc<AtomicBool>,
+    db_pool: DbPool,
+    db_healthy: Arc<AtomicBool>,
     overall_healthy: Arc<AtomicBool>,
 }
 
 impl HealthChecker {
-    pub fn new(pg_pool: PgPool, redis_conn: Option<ConnectionManager>) -> Self {
-        let has_redis = redis_conn.is_some();
+    pub fn new(db_pool: DbPool) -> Self {
         Self {
-            pg_pool,
-            redis_conn,
-            pg_healthy: Arc::new(AtomicBool::new(true)),
-            redis_healthy: Arc::new(AtomicBool::new(has_redis)),
+            db_pool,
+            db_healthy: Arc::new(AtomicBool::new(true)),
             overall_healthy: Arc::new(AtomicBool::new(true)),
         }
     }
 
-    #[allow(dead_code)]
-    pub fn pg_healthy(&self) -> bool {
-        self.pg_healthy.load(Ordering::Acquire)
-    }
-
-    #[allow(dead_code)]
-    pub fn redis_healthy(&self) -> bool {
-        self.redis_healthy.load(Ordering::Acquire)
+    pub fn db_healthy(&self) -> bool {
+        self.db_healthy.load(Ordering::Acquire)
     }
 
     pub fn is_healthy(&self) -> bool {
@@ -50,52 +38,29 @@ impl HealthChecker {
     }
 
     async fn check_all(&self) {
-        let pg_ok = self.check_pg().await;
-        self.pg_healthy.store(pg_ok, Ordering::Release);
+        let db_ok = self.check_db().await;
+        self.db_healthy.store(db_ok, Ordering::Release);
 
-        let redis_ok = if self.redis_conn.is_some() {
-            self.check_redis().await
-        } else {
-            false
-        };
-        self.redis_healthy.store(redis_ok, Ordering::Release);
-
-        let overall = pg_ok;
         let prev = self.overall_healthy.load(Ordering::Acquire);
+        self.overall_healthy.store(db_ok, Ordering::Release);
 
-        self.overall_healthy.store(overall, Ordering::Release);
-
-        if prev != overall {
-            if overall {
+        if prev != db_ok {
+            if db_ok {
                 log::info!("Service health restored");
             } else {
-                log::warn!(
-                    "Service degraded: pg={}, redis={}",
-                    pg_ok, redis_ok
-                );
+                log::warn!("Service degraded: db={}", db_ok);
             }
-        } else if !redis_ok && self.redis_conn.is_some() {
-            log::warn!("Redis unavailable, running in degraded mode");
         }
     }
 
-    async fn check_pg(&self) -> bool {
-        sqlx::query("SELECT 1")
-            .execute(&self.pg_pool)
-            .await
-            .is_ok()
-    }
-
-    async fn check_redis(&self) -> bool {
-        if let Some(ref conn) = self.redis_conn {
-            let mut conn = conn.clone();
-            let pong: String = redis::cmd("PING")
-                .query_async(&mut conn)
-                .await
-                .unwrap_or_default();
-            pong.to_uppercase() == "PONG"
-        } else {
-            false
+    async fn check_db(&self) -> bool {
+        match &self.db_pool {
+            DbPool::Postgres(pg) => {
+                sqlx::query("SELECT 1").execute(pg).await.is_ok()
+            }
+            DbPool::Sqlite(sq) => {
+                sqlx::query("SELECT 1").execute(sq).await.is_ok()
+            }
         }
     }
 }

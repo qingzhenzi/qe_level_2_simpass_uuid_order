@@ -1,25 +1,24 @@
 use actix_web::{web, HttpResponse};
-use sqlx::PgPool;
 use uuid::Uuid;
-use redis::aio::ConnectionManager;
+use crate::db::DbPool;
 use crate::models::{
     InitiateDeductionRequest, ConfirmDeductionRequest, CancelDeductionRequest,
     ApiResponse
 };
 use crate::services::deduction;
 use crate::config::Config;
+use crate::cache::backend::CacheBackend;
 
 pub async fn initiate(
-    pg_pool: web::Data<PgPool>,
-    redis_conn: web::Data<Option<ConnectionManager>>,
+    db: web::Data<DbPool>,
+    cache: web::Data<CacheBackend>,
     config: web::Data<Config>,
     body: web::Json<InitiateDeductionRequest>,
 ) -> Result<HttpResponse, crate::errors::AppError> {
-    let mut conn = redis_conn.get_ref().clone();
+    let mut cache = cache.get_ref().clone();
     let result = deduction::initiate_deduction(
-        pg_pool.get_ref(),
-        &mut conn,
-        &config.redis_prefix,
+        db.get_ref(),
+        &mut cache,
         body.developer_uuid,
         body.amount,
         config.deduction_timeout_secs,
@@ -29,16 +28,14 @@ pub async fn initiate(
 }
 
 pub async fn confirm(
-    pg_pool: web::Data<PgPool>,
-    redis_conn: web::Data<Option<ConnectionManager>>,
-    config: web::Data<Config>,
+    db: web::Data<DbPool>,
+    cache: web::Data<CacheBackend>,
     body: web::Json<ConfirmDeductionRequest>,
 ) -> Result<HttpResponse, crate::errors::AppError> {
-    let mut redis_conn = redis_conn.get_ref().clone();
+    let mut cache = cache.get_ref().clone();
     deduction::confirm_deduction(
-        pg_pool.get_ref(),
-        &mut redis_conn,
-        &config.redis_prefix,
+        db.get_ref(),
+        &mut cache,
         body.into_inner(),
     ).await?;
 
@@ -46,16 +43,14 @@ pub async fn confirm(
 }
 
 pub async fn cancel(
-    pg_pool: web::Data<PgPool>,
-    redis_conn: web::Data<Option<ConnectionManager>>,
-    config: web::Data<Config>,
+    db: web::Data<DbPool>,
+    cache: web::Data<CacheBackend>,
     body: web::Json<CancelDeductionRequest>,
 ) -> Result<HttpResponse, crate::errors::AppError> {
-    let mut redis_conn = redis_conn.get_ref().clone();
+    let mut cache = cache.get_ref().clone();
     deduction::cancel_deduction(
-        pg_pool.get_ref(),
-        &mut redis_conn,
-        &config.redis_prefix,
+        db.get_ref(),
+        &mut cache,
         body.into_inner(),
     ).await?;
 
@@ -63,19 +58,18 @@ pub async fn cancel(
 }
 
 pub async fn get_transaction(
-    pg_pool: web::Data<PgPool>,
+    db: web::Data<DbPool>,
     path: web::Path<Uuid>,
 ) -> Result<HttpResponse, crate::errors::AppError> {
     let tx_token = path.into_inner();
-    let repo = crate::repositories::TransactionRepository::new(pg_pool.get_ref());
+    let repo = crate::repositories::TransactionRepository::new(db.get_ref().clone());
     let tx = repo.get_by_token(tx_token).await?;
     Ok(HttpResponse::Ok().json(ApiResponse::success(tx)))
 }
 
 pub async fn list_transactions(
-    pg_pool: web::Data<PgPool>,
-    _redis_conn: web::Data<Option<ConnectionManager>>,
-    _config: web::Data<Config>,
+    db: web::Data<DbPool>,
+    _cache: web::Data<CacheBackend>,
     query: web::Query<std::collections::HashMap<String, String>>,
 ) -> Result<HttpResponse, crate::errors::AppError> {
     let page: i64 = query.get("page").and_then(|v| v.parse().ok()).unwrap_or(1);
@@ -84,7 +78,7 @@ pub async fn list_transactions(
         .and_then(|v| Uuid::parse_str(v).ok());
     let status = query.get("status").map(|s| s.as_str());
 
-    let repo = crate::repositories::TransactionRepository::new(pg_pool.get_ref());
+    let repo = crate::repositories::TransactionRepository::new(db.get_ref().clone());
     let (txs, total) = repo.list_paginated(page, page_size, dev_uuid, status).await?;
 
     let resp = crate::models::PaginatedResponse::new(txs, total, page, page_size);

@@ -1,14 +1,14 @@
 use actix_web::{web, HttpResponse};
-use redis::aio::ConnectionManager;
-use sqlx::PgPool;
 use uuid::Uuid;
 use chrono::Utc;
+use crate::db::DbPool;
 use crate::config::Config;
 use crate::errors::AppError;
 use crate::models::*;
+use crate::cache::backend::CacheBackend;
 
 pub async fn create_developer(
-    pg_pool: web::Data<PgPool>,
+    db: web::Data<DbPool>,
     body: web::Json<CreateDeveloperRequest>,
 ) -> Result<HttpResponse, AppError> {
     let dev_uuid = body.developer_uuid.unwrap_or_else(Uuid::new_v4);
@@ -23,27 +23,54 @@ pub async fn create_developer(
         .map(|t| t.and_utc())
         .unwrap_or(now);
 
-    sqlx::query(
-        r#"INSERT INTO developers 
-           (developer_uuid, developer_name, successful_auths, risky_marks_available,
-            total_risky_marks_earned, total_risky_marks_used, last_auth_time,
-            auths_needed_for_next_mark, create_time, updated_at, deduction_available, 
-            deduction_limit, rate_limit_per_second, recovery_amount, recovery_interval_secs)
-           VALUES ($1, $2, $3, 0, 0, 0, $4, 0, $5, $6, $7, $8, $9, $10, $11)"#
-    )
-    .bind(dev_uuid)
-    .bind(&body.developer_name)
-    .bind(body.successful_auths.unwrap_or(0))
-    .bind(last_auth)
-    .bind(create_time)
-    .bind(now)
-    .bind(body.deduction_available.unwrap_or(0))
-    .bind(body.deduction_limit.unwrap_or(1000))
-    .bind(body.rate_limit_per_second.unwrap_or(100))
-    .bind(body.recovery_amount.unwrap_or(10))
-    .bind(body.recovery_interval_secs.unwrap_or(60))
-    .execute(pg_pool.get_ref())
-    .await?;
+    match db.get_ref() {
+        DbPool::Postgres(pg) => {
+            sqlx::query(
+                r#"INSERT INTO developers
+                   (developer_uuid, developer_name, successful_auths, risky_marks_available,
+                    total_risky_marks_earned, total_risky_marks_used, last_auth_time,
+                    auths_needed_for_next_mark, create_time, updated_at, deduction_available,
+                    deduction_limit, rate_limit_per_second, recovery_amount, recovery_interval_secs)
+                   VALUES ($1, $2, $3, 0, 0, 0, $4, 0, $5, $6, $7, $8, $9, $10, $11)"#
+            )
+            .bind(dev_uuid)
+            .bind(&body.developer_name)
+            .bind(body.successful_auths.unwrap_or(0))
+            .bind(last_auth)
+            .bind(create_time)
+            .bind(now)
+            .bind(body.deduction_available.unwrap_or(0))
+            .bind(body.deduction_limit.unwrap_or(1000))
+            .bind(body.rate_limit_per_second.unwrap_or(100))
+            .bind(body.recovery_amount.unwrap_or(10))
+            .bind(body.recovery_interval_secs.unwrap_or(60))
+            .execute(pg)
+            .await?;
+        }
+        DbPool::Sqlite(sq) => {
+            sqlx::query(
+                r#"INSERT INTO developers
+                   (developer_uuid, developer_name, successful_auths, risky_marks_available,
+                    total_risky_marks_earned, total_risky_marks_used, last_auth_time,
+                    auths_needed_for_next_mark, create_time, updated_at, deduction_available,
+                    deduction_limit, rate_limit_per_second, recovery_amount, recovery_interval_secs)
+                   VALUES ($1, $2, $3, 0, 0, 0, $4, 0, $5, $6, $7, $8, $9, $10, $11)"#
+            )
+            .bind(dev_uuid.to_string())
+            .bind(&body.developer_name)
+            .bind(body.successful_auths.unwrap_or(0))
+            .bind(last_auth.map(|d| d.to_rfc3339()))
+            .bind(create_time.to_rfc3339())
+            .bind(now.to_rfc3339())
+            .bind(body.deduction_available.unwrap_or(0))
+            .bind(body.deduction_limit.unwrap_or(1000))
+            .bind(body.rate_limit_per_second.unwrap_or(100))
+            .bind(body.recovery_amount.unwrap_or(10))
+            .bind(body.recovery_interval_secs.unwrap_or(60))
+            .execute(sq)
+            .await?;
+        }
+    }
 
     log::info!("Developer created: {} ({})", body.developer_name, dev_uuid);
     Ok(HttpResponse::Created().json(ApiResponse::success(serde_json::json!({
@@ -52,8 +79,8 @@ pub async fn create_developer(
 }
 
 pub async fn list_developers(
-    pg_pool: web::Data<PgPool>,
-    redis_conn: web::Data<Option<ConnectionManager>>,
+    db: web::Data<DbPool>,
+    cache: web::Data<CacheBackend>,
     config: web::Data<Config>,
     query: web::Query<std::collections::HashMap<String, String>>,
 ) -> Result<HttpResponse, AppError> {
@@ -70,151 +97,312 @@ pub async fn list_developers(
         search.as_ref().map(|s| s.as_str()).unwrap_or("")
     );
 
-    let mut redis_conn = redis_conn.get_ref().clone();
-    if let Some(ref mut conn) = redis_conn {
-        use redis::AsyncCommands;
-        if let Ok(cached) = conn.get::<_, Option<String>>(&cache_key).await {
-            if let Some(data) = cached {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                    return Ok(HttpResponse::Ok().json(ApiResponse::success(v)));
-                }
-            }
+    // Try cache first
+    {
+        let mut cache_guard = cache.get_ref().clone();
+        if let Ok(Some(cached)) = get_from_cache(&mut cache_guard, &cache_key).await {
+            return Ok(HttpResponse::Ok().json(ApiResponse::success(cached)));
         }
     }
 
-    let (developers, total) = if let Some(keyword) = search {
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM developers WHERE developer_name ILIKE $1"
-        )
-        .bind(format!("%{}%", keyword))
-        .fetch_one(pg_pool.get_ref())
-        .await?;
+    let (developers, total) = match db.get_ref() {
+        DbPool::Postgres(pg) => {
+            if let Some(keyword) = search {
+                let count: (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM developers WHERE developer_name ILIKE $1"
+                )
+                .bind(format!("%{}%", keyword))
+                .fetch_one(pg)
+                .await?;
 
-        let devs = sqlx::query_as::<_, Developer>(
-            r#"SELECT * FROM developers
-               WHERE developer_name ILIKE $1
-               ORDER BY create_time DESC
-               LIMIT $2 OFFSET $3"#
-        )
-        .bind(format!("%{}%", keyword))
-        .bind(page_size)
-        .bind(offset)
-        .fetch_all(pg_pool.get_ref())
-        .await?;
+                let devs = sqlx::query_as::<_, Developer>(
+                    r#"SELECT * FROM developers
+                       WHERE developer_name ILIKE $1
+                       ORDER BY create_time DESC
+                       LIMIT $2 OFFSET $3"#
+                )
+                .bind(format!("%{}%", keyword))
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(pg)
+                .await?;
 
-        (devs, count.0)
-    } else {
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM developers")
-            .fetch_one(pg_pool.get_ref())
-            .await?;
+                (devs, count.0)
+            } else {
+                let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM developers")
+                    .fetch_one(pg)
+                    .await?;
 
-        let devs = sqlx::query_as::<_, Developer>(
-            r#"SELECT * FROM developers
-               ORDER BY create_time DESC
-               LIMIT $1 OFFSET $2"#
-        )
-        .bind(page_size)
-        .bind(offset)
-        .fetch_all(pg_pool.get_ref())
-        .await?;
+                let devs = sqlx::query_as::<_, Developer>(
+                    r#"SELECT * FROM developers
+                       ORDER BY create_time DESC
+                       LIMIT $1 OFFSET $2"#
+                )
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(pg)
+                .await?;
 
-        (devs, count.0)
+                (devs, count.0)
+            }
+        }
+        DbPool::Sqlite(sq) => {
+            if let Some(keyword) = search {
+                let count: (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM developers WHERE developer_name LIKE $1"
+                )
+                .bind(format!("%{}%", keyword))
+                .fetch_one(sq)
+                .await?;
+
+                let devs = sqlx::query_as::<_, Developer>(
+                    r#"SELECT * FROM developers
+                       WHERE developer_name LIKE $1
+                       ORDER BY create_time DESC
+                       LIMIT $2 OFFSET $3"#
+                )
+                .bind(format!("%{}%", keyword))
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(sq)
+                .await?;
+
+                (devs, count.0)
+            } else {
+                let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM developers")
+                    .fetch_one(sq)
+                    .await?;
+
+                let devs = sqlx::query_as::<_, Developer>(
+                    r#"SELECT * FROM developers
+                       ORDER BY create_time DESC
+                       LIMIT $1 OFFSET $2"#
+                )
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(sq)
+                .await?;
+
+                (devs, count.0)
+            }
+        }
     };
 
     let resp = PaginatedResponse::new(developers, total, page, page_size);
 
-    if let Some(ref mut conn) = redis_conn {
-        use redis::AsyncCommands;
-        let _: Result<(), _> = conn.set_ex(&cache_key, serde_json::to_string(&resp).unwrap_or_default(), 5).await;
+    // Cache the result
+    {
+        let mut cache_guard = cache.get_ref().clone();
+        let _ = set_cache(&mut cache_guard, &cache_key, &resp, 5).await;
     }
 
     Ok(HttpResponse::Ok().json(ApiResponse::success(resp)))
 }
 
 pub async fn get_developer(
-    pg_pool: web::Data<PgPool>,
+    db: web::Data<DbPool>,
     path: web::Path<Uuid>,
 ) -> Result<HttpResponse, AppError> {
     let dev_uuid = path.into_inner();
-    let dev = sqlx::query_as::<_, Developer>(
-        "SELECT * FROM developers WHERE developer_uuid = $1"
-    )
-    .bind(dev_uuid)
-    .fetch_optional(pg_pool.get_ref())
-    .await?
+    let dev = match db.get_ref() {
+        DbPool::Postgres(pg) => {
+            sqlx::query_as::<_, Developer>(
+                "SELECT * FROM developers WHERE developer_uuid = $1"
+            )
+            .bind(dev_uuid)
+            .fetch_optional(pg)
+            .await?
+        }
+        DbPool::Sqlite(sq) => {
+            sqlx::query_as::<_, Developer>(
+                "SELECT * FROM developers WHERE developer_uuid = $1"
+            )
+            .bind(dev_uuid.to_string())
+            .fetch_optional(sq)
+            .await?
+        }
+    }
     .ok_or_else(|| AppError::NotFound("Developer not found".into()))?;
 
     Ok(HttpResponse::Ok().json(ApiResponse::success(dev)))
 }
 
 pub async fn update_developer(
-    pg_pool: web::Data<PgPool>,
+    db: web::Data<DbPool>,
     path: web::Path<Uuid>,
     body: web::Json<UpdateDeveloperRequest>,
 ) -> Result<HttpResponse, AppError> {
     let dev_uuid = path.into_inner();
 
-    let _existing = sqlx::query_as::<_, Developer>(
-        "SELECT * FROM developers WHERE developer_uuid = $1"
-    )
-    .bind(dev_uuid)
-    .fetch_optional(pg_pool.get_ref())
-    .await?
+    let _existing = match db.get_ref() {
+        DbPool::Postgres(pg) => {
+            sqlx::query_as::<_, Developer>(
+                "SELECT * FROM developers WHERE developer_uuid = $1"
+            )
+            .bind(dev_uuid)
+            .fetch_optional(pg)
+            .await?
+        }
+        DbPool::Sqlite(sq) => {
+            sqlx::query_as::<_, Developer>(
+                "SELECT * FROM developers WHERE developer_uuid = $1"
+            )
+            .bind(dev_uuid.to_string())
+            .fetch_optional(sq)
+            .await?
+        }
+    }
     .ok_or_else(|| AppError::NotFound("Developer not found".into()))?;
 
     let last_auth = body.last_auth_time.as_ref()
         .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok())
         .map(|t| t.and_utc());
 
-    sqlx::query(
-        r#"UPDATE developers SET 
-           developer_name = COALESCE($1, developer_name),
-           successful_auths = COALESCE($2, successful_auths),
-           last_auth_time = COALESCE($3, last_auth_time),
-           rate_limit_per_second = COALESCE($4, rate_limit_per_second),
-           deduction_available = COALESCE($5, deduction_available),
-           deduction_limit = COALESCE($6, deduction_limit),
-           recovery_amount = COALESCE($7, recovery_amount),
-           recovery_interval_secs = COALESCE($8, recovery_interval_secs),
-           updated_at = NOW()
-           WHERE developer_uuid = $9"#
-    )
-    .bind(body.developer_name.as_ref())
-    .bind(body.successful_auths)
-    .bind(last_auth)
-    .bind(body.rate_limit_per_second)
-    .bind(body.deduction_available)
-    .bind(body.deduction_limit)
-    .bind(body.recovery_amount)
-    .bind(body.recovery_interval_secs)
-    .bind(dev_uuid)
-    .execute(pg_pool.get_ref())
-    .await?;
+    match db.get_ref() {
+        DbPool::Postgres(pg) => {
+            sqlx::query(
+                r#"UPDATE developers SET
+                   developer_name = COALESCE($1, developer_name),
+                   successful_auths = COALESCE($2, successful_auths),
+                   last_auth_time = COALESCE($3, last_auth_time),
+                   rate_limit_per_second = COALESCE($4, rate_limit_per_second),
+                   deduction_available = COALESCE($5, deduction_available),
+                   deduction_limit = COALESCE($6, deduction_limit),
+                   recovery_amount = COALESCE($7, recovery_amount),
+                   recovery_interval_secs = COALESCE($8, recovery_interval_secs),
+                   updated_at = NOW()
+                   WHERE developer_uuid = $9"#
+            )
+            .bind(body.developer_name.as_ref())
+            .bind(body.successful_auths)
+            .bind(last_auth)
+            .bind(body.rate_limit_per_second)
+            .bind(body.deduction_available)
+            .bind(body.deduction_limit)
+            .bind(body.recovery_amount)
+            .bind(body.recovery_interval_secs)
+            .bind(dev_uuid)
+            .execute(pg)
+            .await?;
+        }
+        DbPool::Sqlite(sq) => {
+            sqlx::query(
+                r#"UPDATE developers SET
+                   developer_name = COALESCE($1, developer_name),
+                   successful_auths = COALESCE($2, successful_auths),
+                   last_auth_time = COALESCE($3, last_auth_time),
+                   rate_limit_per_second = COALESCE($4, rate_limit_per_second),
+                   deduction_available = COALESCE($5, deduction_available),
+                   deduction_limit = COALESCE($6, deduction_limit),
+                   recovery_amount = COALESCE($7, recovery_amount),
+                   recovery_interval_secs = COALESCE($8, recovery_interval_secs),
+                   updated_at = $9
+                   WHERE developer_uuid = $10"#
+            )
+            .bind(body.developer_name.as_ref())
+            .bind(body.successful_auths)
+            .bind(last_auth.map(|d| d.to_rfc3339()))
+            .bind(body.rate_limit_per_second)
+            .bind(body.deduction_available)
+            .bind(body.deduction_limit)
+            .bind(body.recovery_amount)
+            .bind(body.recovery_interval_secs)
+            .bind(Utc::now().to_rfc3339())
+            .bind(dev_uuid.to_string())
+            .execute(sq)
+            .await?;
+        }
+    }
 
     log::info!("Developer updated: {}", dev_uuid);
     Ok(HttpResponse::Ok().json(ApiResponse::<()>::success_msg("Developer updated")))
 }
 
 pub async fn delete_developer(
-    pg_pool: web::Data<PgPool>,
+    db: web::Data<DbPool>,
     path: web::Path<Uuid>,
 ) -> Result<HttpResponse, AppError> {
     let dev_uuid = path.into_inner();
 
-    let result = sqlx::query("DELETE FROM developers WHERE developer_uuid = $1")
-        .bind(dev_uuid)
-        .execute(pg_pool.get_ref())
-        .await?;
+    match db.get_ref() {
+        DbPool::Postgres(pg) => {
+            let result = sqlx::query("DELETE FROM developers WHERE developer_uuid = $1")
+                .bind(dev_uuid)
+                .execute(pg)
+                .await?;
 
-    if result.rows_affected() == 0 {
-        return Err(AppError::NotFound("Developer not found".into()));
+            if result.rows_affected() == 0 {
+                return Err(AppError::NotFound("Developer not found".into()));
+            }
+
+            sqlx::query("DELETE FROM deduction_transactions WHERE developer_uuid = $1")
+                .bind(dev_uuid)
+                .execute(pg)
+                .await?;
+        }
+        DbPool::Sqlite(sq) => {
+            let result = sqlx::query("DELETE FROM developers WHERE developer_uuid = $1")
+                .bind(dev_uuid.to_string())
+                .execute(sq)
+                .await?;
+
+            if result.rows_affected() == 0 {
+                return Err(AppError::NotFound("Developer not found".into()));
+            }
+
+            sqlx::query("DELETE FROM deduction_transactions WHERE developer_uuid = $1")
+                .bind(dev_uuid.to_string())
+                .execute(sq)
+                .await?;
+        }
     }
-
-    sqlx::query("DELETE FROM deduction_transactions WHERE developer_uuid = $1")
-        .bind(dev_uuid)
-        .execute(pg_pool.get_ref())
-        .await?;
 
     log::info!("Developer deleted: {}", dev_uuid);
     Ok(HttpResponse::Ok().json(ApiResponse::<()>::success_msg("Developer deleted")))
+}
+
+// ── 缓存辅助函数 ──────────────────────────────────────────────────
+
+async fn get_from_cache(
+    cache: &mut CacheBackend,
+    key: &str,
+) -> Result<Option<serde_json::Value>, AppError> {
+    match cache {
+        CacheBackend::Redis(redis_cache) => {
+            if let Some(ref mut conn) = redis_cache.conn {
+                use redis::AsyncCommands;
+                if let Ok(Some(data)) = conn.get::<_, Option<String>>(key).await {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                        return Ok(Some(v));
+                    }
+                }
+            }
+        }
+        CacheBackend::Memory(_) => {
+            // Memory cache doesn't support generic key-value storage for this pattern
+            // (only deduction-specific ops). Skip caching in memory mode.
+        }
+    }
+    Ok(None)
+}
+
+async fn set_cache(
+    cache: &mut CacheBackend,
+    key: &str,
+    value: &impl serde::Serialize,
+    ttl_secs: u64,
+) -> Result<(), AppError> {
+    match cache {
+        CacheBackend::Redis(redis_cache) => {
+            if let Some(ref mut conn) = redis_cache.conn {
+                use redis::AsyncCommands;
+                let json = serde_json::to_string(value).unwrap_or_default();
+                let _: Result<(), _> = conn.set_ex(key, json, ttl_secs).await;
+            }
+        }
+        CacheBackend::Memory(_) => {
+            // Skip �?memory cache only handles deduction-specific data
+        }
+    }
+    Ok(())
 }

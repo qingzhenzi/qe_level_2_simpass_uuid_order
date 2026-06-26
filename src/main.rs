@@ -12,14 +12,17 @@ mod tasks;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware as actix_middleware};
 use actix_web::middleware::from_fn;
 use actix_cors::Cors;
-use redis::aio::ConnectionManager;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::config::Config;
+use crate::db::DbPool;
+use crate::db::health::HealthChecker;
+use crate::db::migrations::run_migrations;
+use crate::cache::backend::CacheBackend;
 
 struct AppState {
     #[allow(dead_code)]
-    health_checker: db::health::HealthChecker,
+    health_checker: HealthChecker,
     service_healthy: Arc<AtomicBool>,
 }
 
@@ -50,33 +53,56 @@ async fn main() -> std::io::Result<()> {
     .format_timestamp_millis()
     .init();
 
-    log::info!("Starting server on {}:{}, log_level: {}",
-        cfg.server_host, cfg.server_port, cfg.log_level);
+    log::info!("Starting server on {}:{}", cfg.server_host, cfg.server_port);
+    log::info!("DB backend: {:?}", cfg.db_backend);
+    log::info!("Cache backend: {:?}", cfg.cache_backend);
+    log::info!("Log level: {}", cfg.log_level);
 
-    let pg_pool = db::pg_pool::create_pool(&cfg)
-        .await
-        .expect("Failed to create PostgreSQL pool");
+    // ── Database ──────────────────────────────────────────────────────
+
+    let db_pool = DbPool::create(&cfg).await
+        .expect("Failed to create database pool");
 
     log::info!("Running database migrations...");
+    run_migrations(&db_pool, &cfg.db_backend).await;
 
-    db::migrations::run_migrations(&pg_pool).await;
+    // ── Redis / Cache ─────────────────────────────────────────────────
 
-    let redis_conn = match db::redis_pool::create_connection_manager(&cfg).await {
-        Ok(conn) => {
-            log::info!("Redis connection manager established");
-            Some(conn)
+    let redis_conn: Option<redis::aio::ConnectionManager> = if cfg.cache_backend == crate::config::CacheBackend::Redis {
+        match crate::db::redis_pool::create_connection_manager(&cfg).await {
+            Ok(conn) => {
+                log::info!("Redis connection manager established");
+                Some(conn)
+            }
+            Err(e) => {
+                log::warn!("Redis not available (running with memory cache): {}", e);
+                None
+            }
         }
-        Err(e) => {
-            log::warn!("Redis not available (server will run in degraded mode): {}", e);
-            None
-        }
+    } else {
+        log::info!("Using in-memory cache (Redis disabled)");
+        None
     };
 
-    let health_checker = db::health::HealthChecker::new(pg_pool.clone(), redis_conn.clone());
+    let cache_backend = CacheBackend::from_config(&cfg.cache_backend, redis_conn.clone(), cfg.redis_prefix.clone());
+
+    // ── Startup: expire stale transactions and rebuild cache ──────────
+
+    if let Err(e) = services::deduction::expire_stale_transactions(&db_pool).await {
+        log::warn!("[Startup] Failed to expire stale transactions: {}", e);
+    }
+
+    let mut cache_for_rebuild = cache_backend.clone();
+    if let Err(e) = services::deduction::rebuild_cache_state(&db_pool, &mut cache_for_rebuild).await {
+        log::error!("[Startup] Failed to rebuild cache state: {}", e);
+    }
+
+    // ── Health checker ────────────────────────────────────────────────
+
+    let health_checker = HealthChecker::new(db_pool.clone());
     let service_healthy = Arc::new(AtomicBool::new(true));
     let service_healthy_clone = service_healthy.clone();
     let health_checker_for_health = health_checker.clone();
-    let health_checker_for_start = health_checker.clone();
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(5));
@@ -87,17 +113,22 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
-    health_checker_for_start.start_health_check();
+    health_checker.clone().start_health_check();
+
+    // ── QPS Tracker ───────────────────────────────────────────────────
 
     let qps_tracker = services::qps::QpsTracker::new(
-        pg_pool.clone(),
+        db_pool.clone(),
         redis_conn.clone(),
         cfg.redis_prefix.clone(),
     );
     qps_tracker.clone().start_aggregation();
-    // NOTE: cleanup is handled by Redis TTL (7200s on each counter key)
 
-    tasks::start_expiration_task(pg_pool.clone(), redis_conn.clone(), cfg.redis_prefix.clone());
+    // ── Background tasks ──────────────────────────────────────────────
+
+    tasks::start_expiration_task(db_pool.clone(), cache_backend.clone());
+
+    // ── HTTP Server ───────────────────────────────────────────────────
 
     let bind_addr = format!("{}:{}", cfg.server_host, cfg.server_port);
     log::info!("Listening on {}", bind_addr);
@@ -112,14 +143,16 @@ async fn main() -> std::io::Result<()> {
             .max_age(3600);
 
         let service_healthy = service_healthy.clone();
+        let cache_backend = cache_backend.clone();
 
         App::new()
             .wrap(actix_middleware::Logger::default())
             .wrap(cors)
             .wrap(from_fn(admin_auth_middleware))
             .wrap(from_fn(rate_limit_middleware))
-            .app_data(web::Data::new(pg_pool.clone()))
-            .app_data(web::Data::new(redis_conn.clone() as Option<ConnectionManager>))
+            .app_data(web::Data::new(db_pool.clone()))
+            .app_data(web::Data::new(redis_conn.clone()))
+            .app_data(web::Data::new(cache_backend))
             .app_data(web::Data::new(cfg_data.clone()))
             .app_data(web::Data::new(qps_tracker.clone()))
             .app_data(web::Data::new(AppState {
@@ -152,7 +185,7 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
-// ── 中间件函数 ──────────────────────────────────────────────
+// ── 中间件函数 ──────────────────────────────────────────────────────
 
 async fn admin_auth_middleware(
     req: actix_web::dev::ServiceRequest,
@@ -203,12 +236,10 @@ async fn rate_limit_middleware(
 ) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
     use actix_web::HttpResponse;
 
-    let redis_conn = req.app_data::<actix_web::web::Data<Option<ConnectionManager>>>();
+    let redis_conn = req.app_data::<actix_web::web::Data<Option<redis::aio::ConnectionManager>>>();
     let qps_tracker = req.app_data::<actix_web::web::Data<crate::services::qps::QpsTracker>>();
-    let redis_prefix = req
-        .app_data::<actix_web::web::Data<Config>>()
-        .map(|c| c.redis_prefix.clone())
-        .unwrap_or_else(|| "sl:uuid".to_string());
+    let config = req.app_data::<actix_web::web::Data<Config>>();
+    let redis_prefix = config.map(|c| c.redis_prefix.clone()).unwrap_or_else(|| "sl:uuid".into());
     let default_limit = 50000;
 
     let api_path = req.path().to_string();
@@ -218,10 +249,12 @@ async fn rate_limit_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // QPS tracking (works with or without Redis)
     if let Some(ref tracker) = qps_tracker {
         tracker.record_request(&api_path, dev_uuid.as_deref()).await;
     }
 
+    // Rate limiting (Redis only)
     if let Some(Some(conn)) = redis_conn.map(|d| d.get_ref()) {
         let mut conn = conn.clone();
         let total_key = format!("{}:total_requests", redis_prefix);

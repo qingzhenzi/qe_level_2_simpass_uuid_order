@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use sqlx::{FromRow, Row, Error};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
+use sqlx::postgres::PgRow;
+use sqlx::sqlite::SqliteRow;
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct Developer {
     pub developer_uuid: Uuid,
@@ -26,6 +28,59 @@ pub struct Developer {
     pub recovery_amount: i32,
     pub recovery_interval_secs: i32,
     pub last_recovery_time: Option<DateTime<Utc>>,
+}
+
+impl<'r> FromRow<'r, PgRow> for Developer {
+    fn from_row(row: &PgRow) -> Result<Self, Error> {
+        Ok(Developer {
+            developer_uuid: row.try_get("developer_uuid")?,
+            developer_name: row.try_get("developer_name")?,
+            successful_auths: row.try_get("successful_auths")?,
+            risky_marks_available: row.try_get("risky_marks_available")?,
+            total_risky_marks_earned: row.try_get("total_risky_marks_earned")?,
+            total_risky_marks_used: row.try_get("total_risky_marks_used")?,
+            last_auth_time: row.try_get("last_auth_time")?,
+            auths_needed_for_next_mark: row.try_get("auths_needed_for_next_mark")?,
+            create_time: row.try_get("create_time")?,
+            updated_at: row.try_get("updated_at")?,
+            rate_limit_per_second: row.try_get("rate_limit_per_second")?,
+            deduction_available: row.try_get("deduction_available")?,
+            deduction_limit: row.try_get("deduction_limit")?,
+            recovery_amount: row.try_get("recovery_amount")?,
+            recovery_interval_secs: row.try_get("recovery_interval_secs")?,
+            last_recovery_time: row.try_get("last_recovery_time")?,
+        })
+    }
+}
+
+impl<'r> FromRow<'r, SqliteRow> for Developer {
+    fn from_row(row: &SqliteRow) -> Result<Self, Error> {
+        let uuid_str: String = row.try_get("developer_uuid")?;
+        let developer_uuid = Uuid::parse_str(&uuid_str)
+            .map_err(|e| Error::ColumnDecode {
+                index: "developer_uuid".into(),
+                source: Box::new(e),
+            })?;
+
+        Ok(Developer {
+            developer_uuid,
+            developer_name: row.try_get("developer_name")?,
+            successful_auths: row.try_get("successful_auths")?,
+            risky_marks_available: row.try_get("risky_marks_available")?,
+            total_risky_marks_earned: row.try_get("total_risky_marks_earned")?,
+            total_risky_marks_used: row.try_get("total_risky_marks_used")?,
+            last_auth_time: row.try_get("last_auth_time")?,
+            auths_needed_for_next_mark: row.try_get("auths_needed_for_next_mark")?,
+            create_time: row.try_get("create_time")?,
+            updated_at: row.try_get("updated_at")?,
+            rate_limit_per_second: row.try_get("rate_limit_per_second")?,
+            deduction_available: row.try_get("deduction_available")?,
+            deduction_limit: row.try_get("deduction_limit")?,
+            recovery_amount: row.try_get("recovery_amount")?,
+            recovery_interval_secs: row.try_get("recovery_interval_secs")?,
+            last_recovery_time: row.try_get("last_recovery_time")?,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
